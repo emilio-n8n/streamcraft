@@ -2,7 +2,7 @@
 
 All notable changes to StreamCraft are documented here.
 
-## [Unreleased] — productisation (towards v0.2.0, not tagged)
+## [0.2.0] - 2026-11-22
 
 ### Added
 

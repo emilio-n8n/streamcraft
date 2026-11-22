@@ -11,12 +11,18 @@ desktop foundation.
 
 ## Features
 
+- Scene compositor: scenes, z-ordered sources, drag-to-move on the canvas.
+- Sources: flat colour, simplified SMPTE test pattern and text, with opacity,
+  visibility and transform controls.
+- Export the selected scene as SVG or PNG (dependency-free raster encoder).
+- Versioned JSON project files (`streamcraft`, schema 1) with atomic saves.
+- Bounded undo/redo through the shared document history; one step per drag.
 - Native Rust desktop UI (egui/eframe), no web runtime.
-- Versioned JSON project files with atomic saves.
-- Bounded undo/redo through the shared document history.
-- Background jobs with progress and cooperative cancellation.
-- Recent files and persisted preferences.
 - Offline-first: no account, no telemetry, no network required.
+
+**Scope:** this release is a compositor only. Screen capture, webcam, microphone
+and video encoding are not implemented yet; the UI states
+"Compositor only - capture/recording next".
 
 ## Run
 
@@ -46,9 +52,9 @@ Linux windowing development packages are installed by the CI workflow.
 
 ```text
 src/main.rs       CLI and window startup
-src/app.rs        UI, menus and lifecycle
-src/document.rs   application document model
-src/...           domain modules
+src/app.rs        UI, menus, canvas (Painter) and lifecycle
+src/document.rs   UI-free scene/source model, SVG export
+src/render.rs     dependency-free raster renderer and PNG encoder
 ```
 
 The application depends on pinned CraftKit crates from Git. Keep the tag in
@@ -63,7 +69,14 @@ Projects are JSON envelopes:
   "format": "streamcraft",
   "schema_version": 1,
   "app_version": "0.1.0",
-  "document": { }
+  "document": {
+    "title": "Untitled",
+    "scenes": [
+      { "id": 1, "name": "Scene 1", "sources": [] }
+    ],
+    "selected_scene": 0,
+    "next_id": 2
+  }
 }
 ```
 

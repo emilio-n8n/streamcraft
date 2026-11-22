@@ -1,0 +1,16 @@
+[package]
+name = "streamcraft"
+description = "StreamCraft — native Rust desktop application"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/emilio-n8n/streamcraft"
+rust-version = "1.95"
+authors = ["StreamCraft contributors"]
+
+[dependencies]
+craftkit-core = { git = "https://github.com/emilio-n8n/craftkit", tag = "v0.1.0" }
+craftkit-io = { git = "https://github.com/emilio-n8n/craftkit", tag = "v0.1.0" }
+craftkit-jobs = { git = "https://github.com/emilio-n8n/craftkit", tag = "v0.1.0" }
+craftkit-ui = { git = "https://github.com/emilio-n8n/craftkit", tag = "v0.1.0" }
+serde = { version = "1", features = ["derive"] }

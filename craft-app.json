@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "streamcraft",
+  "name": "StreamCraft",
+  "tagline": "Scenes, sources and a compositor for local recording",
+  "repo": "emilio-n8n/streamcraft",
+  "publisher": "emilio-n8n",
+  "upstream": null,
+  "bundle_id": "io.github.emilion8n.streamcraft",
+  "msi_publisher": "emilio-n8n",
+  "apple_team": null,
+  "website": "https://github.com/emilio-n8n/streamcraft",
+  "color": "#ef4444",
+  "icon": "streamcraft-128.png"
+}

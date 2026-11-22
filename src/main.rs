@@ -28,7 +28,7 @@ fn main() -> craftkit_ui::eframe::Result<()> {
                 "{}",
                 cli::help_text(
                     "streamcraft",
-                    "StreamCraft - scene compositor (capture/recording next)"
+                    "StreamCraft - scene compositor with local capture (not a streaming encoder)"
                 )
             );
             return Ok(());

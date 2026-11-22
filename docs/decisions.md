@@ -2,6 +2,59 @@
 
 Short architecture decision records. Newest first.
 
+## ADR-004 — Capture abstraction and honest fallbacks
+
+Date: 2026-11-22
+
+Decision: capture goes through a `CaptureBackend` trait. Linux builds implement
+it with `x11rb`'s core `GetImage`; other platforms return an explicit
+`Unsupported` error. A missing display is a normal error, never a fake frame.
+The preview shows target selection, live frames and the real error text.
+
+Alternatives: use a heavyweight cross-platform capture crate; render a fake
+desktop rectangle when no device exists; fail to start the application.
+
+Reasons: the prompt asks for Linux/X11 first and a clear fallback elsewhere;
+`x11rb` was already resolved in the dependency graph; tests must run headless.
+
+Consequences: the X11 path is smoke-tested under Xvfb with an ignored test; it
+is not claimed to work on Wayland or a physical monitor. Window titles use
+`WM_NAME`, which is absent for some window managers.
+
+## ADR-005 — Recording without promising video encoding
+
+Date: 2026-11-22
+
+Decision: recording is planned from the environment. If `ffmpeg` is on `PATH`,
+composed PNG frames are piped into it to produce MKV/MP4. Otherwise the
+recorder writes a numbered PNG sequence into a directory and explains how to
+mux it. No video encoder is bundled.
+
+Alternatives: bundle FFmpeg bindings; claim recording works without testing;
+require ffmpeg at build time.
+
+Reasons: no ffmpeg binary is available in this environment, so the fallback
+must be real and testable; the UI must never overstate capabilities.
+
+Consequences: MKV/MP4 paths are implemented but not exercised here; PNG
+sequence recording is unit-tested with real files.
+
+## ADR-006 — Schema-compatible transitions
+
+Date: 2026-11-22
+
+Decision: `Scene.transition` is an optional serde field defaulting to a cut.
+The format stays `streamcraft` and `schema_version` stays 1.
+
+Alternatives: bump the schema and write a migration; store transitions in a
+separate file.
+
+Reasons: older v0.1.0 JSON must still open; a defaulted additive field is
+backward compatible and keeps the release snapshot intact.
+
+Consequences: a test parses a v0.1.0 document without the field. A future
+breaking change still requires a schema bump.
+
 ## ADR-001 — Built on CraftKit
 
 Date: 2026-11-22

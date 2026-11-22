@@ -1,25 +1,33 @@
 //! StreamCraft UI, menus, actions and project lifecycle.
 //!
-//! Screen rendering uses egui's `Painter`; export reuses the same document
-//! model through the dependency-free renderer in [`crate::render`].
+//! Canvas drawing uses egui's `Painter`; exports and recording reuse the pure
+//! renderer in [`crate::render`]. Capture is platform-abstracted in
+//! [`crate::capture`] and reports its real status to the user.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use craftkit_io::DocumentHost;
 use craftkit_ui::cli::CliOptions;
 use craftkit_ui::eframe::{self, egui};
 use craftkit_ui::egui::{
     Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
+    ViewportCommand,
 };
 use craftkit_ui::{AppIdentity, AppShell, Tone, dialogs, theme, widgets};
 
+use crate::audio::AudioMonitor;
+use crate::capture::{CaptureBackend, CaptureTarget, default_backend};
 use crate::document::{
     CANVAS_H, CANVAS_W, Color, Document, FORMAT, SCHEMA_VERSION, SMPTE_BARS, SMPTE_LOWER,
-    SourceKind,
+    SourceKind, Transition, TransitionKind,
 };
+use crate::recording::{Container, RecordingSession, choose_plan, find_program};
 use crate::render::render_scene_png;
+use crate::webcam::probe_devices;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CAPTURE_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -31,6 +39,12 @@ enum Action {
     ExportSvg,
     Undo,
     Redo,
+    NextScene,
+    PreviousScene,
+    ToggleFullscreen,
+    ToggleCapture,
+    StartRecording,
+    StopRecording,
     About,
     Settings,
 }
@@ -55,6 +69,12 @@ struct DragState {
     grab_y: f32,
 }
 
+struct CapturePreview {
+    texture: Option<egui::TextureHandle>,
+    last_attempt: Instant,
+    error: Option<String>,
+}
+
 /// The application state.
 pub struct StreamCraftApp {
     shell: AppShell,
@@ -63,6 +83,20 @@ pub struct StreamCraftApp {
     drag: Option<DragState>,
     property_gesture: bool,
     pending: Option<PendingAction>,
+    capture_backend: Box<dyn CaptureBackend>,
+    capture_target: CaptureTarget,
+    capture_targets: Vec<CaptureTarget>,
+    capture_enabled: bool,
+    capture_preview: CapturePreview,
+    audio: AudioMonitor,
+    webcam: crate::webcam::WebcamStatus,
+    recording: Option<RecordingSession>,
+    record_container: Container,
+    record_fps: u32,
+    record_last_frame: Instant,
+    fullscreen: bool,
+    transition_start: Option<Instant>,
+    transition: Transition,
 }
 
 impl StreamCraftApp {
@@ -72,7 +106,7 @@ impl StreamCraftApp {
             id: "streamcraft",
             name: "StreamCraft",
             version: APP_VERSION,
-            tagline: "Compositor only - capture/recording next",
+            tagline: "Scene compositor with local capture - not a streaming encoder",
             repository: Some("https://github.com/emilio-n8n/streamcraft"),
         };
         let shell = AppShell::new(identity);
@@ -81,6 +115,11 @@ impl StreamCraftApp {
         } else {
             Document::default()
         };
+        let transition = document
+            .selected_scene()
+            .map_or(Transition::default(), |scene| scene.transition);
+        let capture_backend = default_backend();
+        let capture_targets = capture_backend.targets().unwrap_or_default();
         let mut app = Self {
             shell,
             host: DocumentHost::new(document, FORMAT, SCHEMA_VERSION, APP_VERSION),
@@ -88,6 +127,24 @@ impl StreamCraftApp {
             drag: None,
             property_gesture: false,
             pending: None,
+            capture_backend,
+            capture_target: CaptureTarget::Screen,
+            capture_targets,
+            capture_enabled: false,
+            capture_preview: CapturePreview {
+                texture: None,
+                last_attempt: Instant::now(),
+                error: None,
+            },
+            audio: AudioMonitor::start(),
+            webcam: probe_devices(),
+            recording: None,
+            record_container: Container::Mkv,
+            record_fps: 30,
+            record_last_frame: Instant::now(),
+            fullscreen: false,
+            transition_start: None,
+            transition,
         };
         app.shell.install_theme(&context.egui_ctx);
         if let Some(path) = options.open {
@@ -101,11 +158,16 @@ impl StreamCraftApp {
             Ok(host) => {
                 self.host = host;
                 self.selected_source = None;
+                self.transition = self
+                    .host
+                    .document()
+                    .selected_scene()
+                    .map_or(Transition::default(), |scene| scene.transition);
                 self.shell.set_status(format!("Opened {}", path.display()));
             }
             Err(error) => {
                 self.shell
-                    .notify(Tone::Error, "Could not open project", error.to_string());
+                    .notify(Tone::Error, "Could not open project", error.to_string())
             }
         }
     }
@@ -113,6 +175,7 @@ impl StreamCraftApp {
     fn new_document(&mut self) {
         self.host.reset(Document::default());
         self.selected_source = None;
+        self.transition = Transition::default();
         self.shell.set_status("New document");
     }
 
@@ -151,6 +214,14 @@ impl StreamCraftApp {
             .history_mut()
             .current_mut()
             .set_opacity(id, opacity);
+    }
+
+    fn edit_transition(&mut self, index: usize, transition: Transition) {
+        self.host.apply(|document| {
+            if let Some(scene) = document.scenes.get_mut(index) {
+                scene.transition = transition;
+            }
+        });
     }
 
     fn edit_text(&mut self, id: u64, text: String) {
@@ -234,12 +305,11 @@ impl StreamCraftApp {
             };
             (name, bytes)
         };
-        let title = if png {
-            "Export scene as PNG"
+        let (title, extension) = if png {
+            ("Export scene as PNG", "png")
         } else {
-            "Export scene as SVG"
+            ("Export scene as SVG", "svg")
         };
-        let extension = if png { "png" } else { "svg" };
         let Some(path) = dialogs::save_project(title, &default_name, extension) else {
             return;
         };
@@ -255,7 +325,7 @@ impl StreamCraftApp {
             }
             Err(error) => {
                 self.shell
-                    .notify(Tone::Error, "Could not export scene", error.to_string());
+                    .notify(Tone::Error, "Could not export scene", error.to_string())
             }
         }
     }
@@ -318,6 +388,172 @@ impl StreamCraftApp {
         }
     }
 
+    fn switch_scene(&mut self, next: bool) {
+        self.finish_gesture();
+        let changed = self.host.apply(|document| {
+            if next {
+                document.next_scene();
+            } else {
+                document.previous_scene();
+            }
+        });
+        if changed {
+            self.selected_source = None;
+            self.transition = self
+                .host
+                .document()
+                .selected_scene()
+                .map_or(Transition::default(), |scene| scene.transition);
+            self.transition_start = Some(Instant::now());
+            self.shell.set_status(format!(
+                "Scene {} - {} transition",
+                self.host.document().selected_scene + 1,
+                self.transition.kind.label()
+            ));
+        }
+    }
+
+    fn select_scene(&mut self, index: usize) {
+        if index == self.host.document().selected_scene {
+            return;
+        }
+        let transition = self
+            .host
+            .document()
+            .scenes
+            .get(index)
+            .map_or(Transition::default(), |scene| scene.transition);
+        if self.host.apply(|document| {
+            document.select_scene(index);
+        }) {
+            self.selected_source = None;
+            self.transition = transition;
+            self.transition_start = Some(Instant::now());
+        }
+    }
+
+    fn toggle_capture(&mut self) {
+        self.capture_enabled = !self.capture_enabled;
+        if self.capture_enabled {
+            match self.capture_backend.targets() {
+                Ok(targets) => {
+                    self.capture_targets = targets;
+                    if !self.capture_targets.contains(&self.capture_target) {
+                        self.capture_target = self
+                            .capture_targets
+                            .first()
+                            .cloned()
+                            .unwrap_or(CaptureTarget::Screen);
+                    }
+                }
+                Err(error) => self.capture_preview.error = Some(error.to_string()),
+            }
+            self.capture_preview.last_attempt = Instant::now() - CAPTURE_INTERVAL;
+            let available = self.capture_backend.available();
+            self.shell.set_status(format!(
+                "Capture preview via {} ({}) - verify on this display",
+                self.capture_backend.name(),
+                if available { "available" } else { "no display" }
+            ));
+        } else {
+            self.capture_preview.texture = None;
+            self.shell.set_status("Capture preview stopped");
+        }
+    }
+
+    fn poll_capture(&mut self, ctx: &egui::Context) {
+        if !self.capture_enabled || self.capture_preview.last_attempt.elapsed() < CAPTURE_INTERVAL {
+            return;
+        }
+        self.capture_preview.last_attempt = Instant::now();
+        match self.capture_backend.capture(&self.capture_target) {
+            Ok(frame) => {
+                let image = frame.to_color_image();
+                match self.capture_preview.texture.as_mut() {
+                    Some(texture) => texture.set(image, egui::TextureOptions::NEAREST),
+                    None => {
+                        self.capture_preview.texture = Some(ctx.load_texture(
+                            "streamcraft-capture",
+                            image,
+                            egui::TextureOptions::NEAREST,
+                        ));
+                    }
+                }
+                self.capture_preview.error = None;
+            }
+            Err(error) => self.capture_preview.error = Some(error.to_string()),
+        }
+    }
+
+    fn start_recording(&mut self) {
+        self.finish_gesture();
+        if self.recording.is_some() {
+            self.shell.notify(
+                Tone::Warning,
+                "Already recording",
+                "Stop the current recording first.",
+            );
+            return;
+        }
+        let extension = self.record_container.extension();
+        let default_name = format!("recording.{extension}");
+        let Some(output) = dialogs::save_project("Start recording", &default_name, extension)
+        else {
+            return;
+        };
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        let program = find_program(&path_var.to_string_lossy(), "ffmpeg");
+        let plan = choose_plan(program, output, self.record_container, self.record_fps);
+        match RecordingSession::start(plan, self.record_fps) {
+            Ok(session) => {
+                self.shell
+                    .set_status(format!("Recording: {}", session.plan().description()));
+                self.recording = Some(session);
+                self.record_last_frame = Instant::now();
+            }
+            Err(error) => self
+                .shell
+                .notify(Tone::Error, "Could not start recording", error),
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        let Some(session) = self.recording.take() else {
+            return;
+        };
+        match session.finish() {
+            Ok(frames) => {
+                self.shell
+                    .set_status(format!("Recording stopped ({frames} frames)"));
+                self.shell.notify(
+                    Tone::Success,
+                    "Recording saved",
+                    format!("{frames} frames written"),
+                );
+            }
+            Err(error) => self.shell.notify(Tone::Error, "Recording failed", error),
+        }
+    }
+
+    fn poll_recording(&mut self) {
+        let interval = Duration::from_millis(u64::from(1000 / self.record_fps.max(1)));
+        if self.record_last_frame.elapsed() < interval {
+            return;
+        }
+        self.record_last_frame = Instant::now();
+        let Some(session) = self.recording.as_mut() else {
+            return;
+        };
+        let Some(scene) = self.host.document().selected_scene().cloned() else {
+            return;
+        };
+        let png = render_scene_png(&scene);
+        if let Err(error) = session.push_frame(&png) {
+            self.shell.notify(Tone::Error, "Recording stopped", error);
+            self.recording = None;
+        }
+    }
+
     fn handle_action(&mut self, action: Action) {
         match action {
             Action::New => self.request_new(),
@@ -344,6 +580,12 @@ impl StreamCraftApp {
                     self.shell.set_status("Redo");
                 }
             }
+            Action::NextScene => self.switch_scene(true),
+            Action::PreviousScene => self.switch_scene(false),
+            Action::ToggleFullscreen => self.fullscreen = !self.fullscreen,
+            Action::ToggleCapture => self.toggle_capture(),
+            Action::StartRecording => self.start_recording(),
+            Action::StopRecording => self.stop_recording(),
             Action::About => self.shell.open_about(),
             Action::Settings => self.shell.open_settings(),
         }
@@ -369,6 +611,14 @@ impl StreamCraftApp {
                 Some(Action::Undo)
             } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y) {
                 Some(Action::Redo)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
+                Some(Action::NextScene)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
+                Some(Action::PreviousScene)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::F11) {
+                Some(Action::ToggleFullscreen)
+            } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::R) {
+                Some(Action::StartRecording)
             } else {
                 None
             }
@@ -383,6 +633,8 @@ impl StreamCraftApp {
         let dirty = self.host.is_dirty();
         let can_undo = self.host.can_undo();
         let can_redo = self.host.can_redo();
+        let recording = self.recording.is_some();
+        let capturing = self.capture_enabled;
         let mut action = None;
         self.shell.top_bar(ui, &title, dirty, |ui| {
             ui.menu_button("File", |ui| {
@@ -428,6 +680,44 @@ impl StreamCraftApp {
                     ui.close();
                 }
             });
+            ui.menu_button("Scene", |ui| {
+                if ui.button("Previous (PageUp)").clicked() {
+                    action = Some(Action::PreviousScene);
+                    ui.close();
+                }
+                if ui.button("Next (PageDown)").clicked() {
+                    action = Some(Action::NextScene);
+                    ui.close();
+                }
+                if ui.button("Toggle fullscreen (F11)").clicked() {
+                    action = Some(Action::ToggleFullscreen);
+                    ui.close();
+                }
+            });
+            ui.menu_button("Capture", |ui| {
+                let label = if capturing {
+                    "Stop capture preview"
+                } else {
+                    "Start capture preview"
+                };
+                if ui.button(label).clicked() {
+                    action = Some(Action::ToggleCapture);
+                    ui.close();
+                }
+                let label = if recording {
+                    "Stop recording"
+                } else {
+                    "Start recording (Ctrl+R)"
+                };
+                if ui.button(label).clicked() {
+                    action = Some(if recording {
+                        Action::StopRecording
+                    } else {
+                        Action::StartRecording
+                    });
+                    ui.close();
+                }
+            });
             if ui.button("About").clicked() {
                 action = Some(Action::About);
             }
@@ -441,17 +731,39 @@ impl StreamCraftApp {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        self.shell.status_bar(ui);
+        let mic_status = self.audio.status().label();
+        let level = self.audio.level();
+        let webcam = self.webcam.description();
+        let recording = self
+            .recording
+            .as_ref()
+            .map_or("idle".to_owned(), |session| {
+                format!("{} frames", session.frames())
+            });
+        self.shell.status_bar_with(ui, |ui| {
+            ui.label(RichText::new(mic_status).size(10.0).color(theme::MUTED));
+            ui.add(
+                egui::ProgressBar::new(level)
+                    .desired_width(60.0)
+                    .show_percentage(),
+            );
+            ui.label(RichText::new(webcam).size(10.0).color(theme::FAINT));
+            ui.label(
+                RichText::new(format!("Recording: {recording}"))
+                    .size(10.0)
+                    .color(theme::MUTED),
+            );
+        });
     }
 
     fn scenes_panel(&mut self, ui: &mut egui::Ui) {
-        let scenes: Vec<(usize, String)> = self
+        let scenes: Vec<(usize, String, Transition)> = self
             .host
             .document()
             .scenes
             .iter()
             .enumerate()
-            .map(|(index, scene)| (index, scene.name.clone()))
+            .map(|(index, scene)| (index, scene.name.clone(), scene.transition))
             .collect();
         let selected_scene = self.host.document().selected_scene;
 
@@ -466,33 +778,59 @@ impl StreamCraftApp {
                     .auto_shrink([false, false])
                     .max_height(180.0)
                     .show(ui, |ui| {
-                        for (index, name) in &scenes {
+                        for (index, name, _) in &scenes {
                             if ui
                                 .selectable_label(*index == selected_scene, name)
                                 .clicked()
                             {
-                                self.host.apply(|document| {
-                                    document.select_scene(*index);
-                                });
-                                self.selected_source = None;
+                                self.select_scene(*index);
                             }
                         }
                     });
                 ui.separator();
-                if ui.button("Add scene").clicked() {
-                    self.host.apply(|document| {
-                        document.add_scene();
+                ui.horizontal(|ui| {
+                    if ui.button("Add scene").clicked() {
+                        self.host.apply(|document| {
+                            document.add_scene();
+                        });
+                        self.selected_source = None;
+                        self.shell.set_status("Scene added");
+                    }
+                    if ui.button("Remove").clicked() {
+                        let index = self.host.document().selected_scene;
+                        self.host.apply(|document| {
+                            document.remove_scene(index);
+                        });
+                        self.clamp_selection();
+                    }
+                });
+                ui.separator();
+                widgets::section_label(ui, "Scene transition");
+                let current = scenes
+                    .iter()
+                    .find(|(index, _, _)| *index == selected_scene)
+                    .map(|(_, _, transition)| *transition)
+                    .unwrap_or_default();
+                let mut kind = current.kind;
+                egui::ComboBox::from_label("On enter")
+                    .selected_text(kind.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut kind, TransitionKind::Cut, "Cut");
+                        ui.selectable_value(&mut kind, TransitionKind::Fade, "Fade");
                     });
-                    self.selected_source = None;
-                    self.shell.set_status("Scene added");
-                }
-                if ui.button("Remove selected scene").clicked() {
-                    let index = self.host.document().selected_scene;
-                    self.host.apply(|document| {
-                        document.remove_scene(index);
-                    });
-                    self.clamp_selection();
-                    self.shell.set_status("Scene removed");
+                let mut duration = current.duration_ms;
+                ui.add(
+                    egui::DragValue::new(&mut duration)
+                        .prefix("ms ")
+                        .speed(10.0)
+                        .range(0..=10_000),
+                );
+                let updated = Transition {
+                    kind,
+                    duration_ms: duration,
+                };
+                if updated != current {
+                    self.edit_transition(selected_scene, updated);
                 }
             });
     }
@@ -572,14 +910,11 @@ impl StreamCraftApp {
     }
 
     fn add_source(&mut self, kind: SourceKind) {
-        let id = {
-            let mut created = None;
-            self.host.apply(|document| {
-                created = document.add_source(kind);
-            });
-            created
-        };
-        self.selected_source = id;
+        let mut created = None;
+        self.host.apply(|document| {
+            created = document.add_source(kind);
+        });
+        self.selected_source = created;
         self.shell
             .set_status(format!("{} source added", kind.label()));
     }
@@ -744,30 +1079,54 @@ impl StreamCraftApp {
 
     fn central_panel(&mut self, ui: &mut egui::Ui) {
         let mut action = None;
+        let mut container = self.record_container;
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Composition");
                 ui.label(
-                    RichText::new("Compositor only - capture/recording next")
+                    RichText::new("Local compositor - capture/recording experimental")
                         .size(11.0)
                         .color(theme::WARNING),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if widgets::toolbar_button(ui, "Export SVG", "Export the scene as SVG")
-                        .clicked()
-                    {
-                        action = Some(Action::ExportSvg);
-                    }
                     if widgets::toolbar_button(ui, "Export PNG", "Export the scene as PNG")
                         .clicked()
                     {
                         action = Some(Action::ExportPng);
                     }
+                    if widgets::toolbar_button(ui, "Export SVG", "Export the scene as SVG")
+                        .clicked()
+                    {
+                        action = Some(Action::ExportSvg);
+                    }
                 });
+            });
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Recording container")
+                        .size(11.0)
+                        .color(theme::MUTED),
+                );
+                egui::ComboBox::from_id_salt("record-container")
+                    .selected_text(container.extension())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut container, Container::Mkv, "mkv");
+                        ui.selectable_value(&mut container, Container::Mp4, "mp4");
+                    });
+                if self.recording.is_some() {
+                    if widgets::toolbar_button(ui, "Stop", "Stop recording").clicked() {
+                        action = Some(Action::StopRecording);
+                    }
+                } else if widgets::toolbar_button(ui, "Record", "Start local recording").clicked() {
+                    action = Some(Action::StartRecording);
+                }
             });
             ui.add_space(6.0);
             self.paint_canvas(ui);
         });
+        if container != self.record_container {
+            self.record_container = container;
+        }
         if let Some(action) = action {
             self.handle_action(action);
         }
@@ -850,6 +1209,20 @@ impl StreamCraftApp {
             }
         }
 
+        if let Some(start) = self.transition_start {
+            let elapsed = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
+            let alpha = 1.0 - self.transition.progress(elapsed);
+            if alpha > 0.0 {
+                painter.rect_filled(
+                    rect,
+                    0.0,
+                    Color32::from_rgba_unmultiplied(0, 0, 0, (alpha * 255.0) as u8),
+                );
+            } else {
+                self.transition_start = None;
+            }
+        }
+
         if let Some(pointer) = response.interact_pointer_pos() {
             let scene_point = (pointer - rect.min) / scale;
             if response.drag_started() {
@@ -893,6 +1266,57 @@ impl StreamCraftApp {
         }
         if (response.drag_stopped() || response.clicked()) && self.drag.take().is_some() {
             self.host.history_mut().end_gesture();
+        }
+    }
+
+    fn capture_panel(&mut self, ctx: &egui::Context) {
+        if !self.capture_enabled {
+            return;
+        }
+        let mut open = true;
+        let mut action = None;
+        let mut selected = self.capture_target.clone();
+        let error = self.capture_preview.error.clone();
+        let texture = self.capture_preview.texture.clone();
+        let targets = self.capture_targets.clone();
+        egui::Window::new("Capture preview")
+            .open(&mut open)
+            .default_size([340.0, 260.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Live preview only - start a recording to save frames")
+                        .size(10.5)
+                        .color(theme::MUTED),
+                );
+                egui::ComboBox::from_label("Target")
+                    .selected_text(selected.to_string())
+                    .show_ui(ui, |ui| {
+                        for target in &targets {
+                            let label = target.to_string();
+                            ui.selectable_value(&mut selected, target.clone(), label);
+                        }
+                    });
+                if let Some(texture) = &texture {
+                    let width = ui.available_width().min(320.0);
+                    ui.image((texture.id(), Vec2::new(width, width * 720.0 / 1280.0)));
+                } else if let Some(error) = &error {
+                    ui.label(RichText::new(error).color(theme::ERROR));
+                } else {
+                    ui.label(RichText::new("Waiting for first frame...").color(theme::FAINT));
+                }
+                if ui.button("Stop capture").clicked() {
+                    action = Some(Action::ToggleCapture);
+                }
+            });
+        if selected != self.capture_target {
+            self.capture_target = selected;
+            self.capture_preview.last_attempt = Instant::now();
+        }
+        if !open {
+            self.capture_enabled = false;
+        }
+        if let Some(action) = action {
+            self.handle_action(action);
         }
     }
 
@@ -954,17 +1378,25 @@ fn slugify(title: &str) -> String {
 
 impl eframe::App for StreamCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        if self.fullscreen {
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+            self.fullscreen = false;
+        }
         self.handle_shortcuts(ui);
+        self.poll_capture(&ctx);
+        self.poll_recording();
         self.top_bar(ui);
         self.status_bar(ui);
         self.scenes_panel(ui);
         self.sources_panel(ui);
         self.inspector_panel(ui);
         self.central_panel(ui);
-        self.unsaved_window(ui.ctx());
-        self.shell.show_windows(ui.ctx());
+        self.capture_panel(&ctx);
+        self.unsaved_window(&ctx);
+        self.shell.show_windows(&ctx);
         self.shell
-            .update_title(ui.ctx(), &self.host.display_name(), self.host.is_dirty());
+            .update_title(&ctx, &self.host.display_name(), self.host.is_dirty());
     }
 }
 
@@ -981,7 +1413,6 @@ mod tests {
 
     #[test]
     fn colour_conversion_respects_opacity() {
-        // egui's Color32 stores premultiplied alpha: 50% of 10/20/30 is 5/10/15.
         let color = to_color32(Color::rgb(10, 20, 30), 0.5);
         assert_eq!(color.r(), 5);
         assert_eq!(color.g(), 10);

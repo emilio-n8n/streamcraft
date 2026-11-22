@@ -166,6 +166,67 @@ impl Source {
     }
 }
 
+/// How one scene replaces another during a live switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransitionKind {
+    /// Instant switch.
+    Cut,
+    /// Cross-fade over the transition duration.
+    Fade,
+}
+
+impl TransitionKind {
+    /// Human-readable label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cut => "Cut",
+            Self::Fade => "Fade",
+        }
+    }
+}
+
+/// Transition applied when a scene becomes active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transition {
+    /// Transition style.
+    pub kind: TransitionKind,
+    /// Duration in milliseconds; ignored for [`TransitionKind::Cut`].
+    pub duration_ms: u32,
+}
+
+impl Default for Transition {
+    fn default() -> Self {
+        Self {
+            kind: TransitionKind::Cut,
+            duration_ms: 0,
+        }
+    }
+}
+
+impl Transition {
+    /// Transition duration clamped to a sane live-switch range.
+    #[must_use]
+    pub fn duration_ms(self) -> u32 {
+        self.duration_ms.min(10_000)
+    }
+
+    /// Effective blend in `0.0..=1.0` at `elapsed_ms` after the switch starts.
+    ///
+    /// A cut is always fully blended; a fade progresses linearly. The value is
+    /// pure so it can be unit-tested and reused by the UI animation.
+    #[must_use]
+    pub fn progress(self, elapsed_ms: u32) -> f32 {
+        match self.kind {
+            TransitionKind::Cut => 1.0,
+            TransitionKind::Fade => {
+                let duration = self.duration_ms().max(1);
+                (elapsed_ms.min(duration) as f32) / duration as f32
+            }
+        }
+    }
+}
+
 /// An ordered collection of sources. Later entries are drawn on top.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
@@ -175,6 +236,12 @@ pub struct Scene {
     pub name: String,
     /// Sources in z order, from back to front.
     pub sources: Vec<Source>,
+    /// Transition used when this scene is activated.
+    ///
+    /// Defaulted so schema-1 files written before transitions existed still
+    /// load unchanged.
+    #[serde(default)]
+    pub transition: Transition,
 }
 
 impl Scene {
@@ -185,6 +252,7 @@ impl Scene {
             id,
             name: name.into(),
             sources: Vec::new(),
+            transition: Transition::default(),
         }
     }
 
@@ -363,6 +431,10 @@ impl Document {
 
         if let Some(scene) = document.scenes.first_mut() {
             scene.name = "Welcome".to_owned();
+            scene.transition = Transition {
+                kind: TransitionKind::Fade,
+                duration_ms: 400,
+            };
 
             let mut background = Source::new(background_id, "Background", SourceKind::Color);
             background.x = 0.0;
@@ -431,6 +503,24 @@ impl Document {
         }
         self.selected_scene = index;
         true
+    }
+
+    /// Select the next scene, wrapping around. Returns the new index.
+    pub fn next_scene(&mut self) -> Option<usize> {
+        if self.scenes.is_empty() {
+            return None;
+        }
+        self.selected_scene = (self.selected_scene + 1) % self.scenes.len();
+        Some(self.selected_scene)
+    }
+
+    /// Select the previous scene, wrapping around. Returns the new index.
+    pub fn previous_scene(&mut self) -> Option<usize> {
+        if self.scenes.is_empty() {
+            return None;
+        }
+        self.selected_scene = (self.selected_scene + self.scenes.len() - 1) % self.scenes.len();
+        Some(self.selected_scene)
     }
 
     /// Clamp the selected-scene index after a structural change.
@@ -549,6 +639,64 @@ mod tests {
         assert_eq!(document.scenes.len(), 1);
         assert_eq!(document.selected_scene, 0);
         assert!(!document.remove_scene(5));
+    }
+
+    #[test]
+    fn scene_graph_navigation_and_transitions() {
+        let mut document = Document::default();
+        let first = document.scenes[0].id;
+        let second = document.add_scene();
+        let third = document.add_scene();
+        assert_eq!(document.scenes.len(), 3);
+        assert_eq!(document.scenes[1].id, second);
+        assert_eq!(document.scenes[2].id, third);
+
+        assert_eq!(document.previous_scene(), Some(1));
+        assert_eq!(document.selected_scene, 1);
+        assert_eq!(document.next_scene(), Some(2));
+        assert_eq!(document.selected_scene, 2);
+        assert_eq!(document.next_scene(), Some(0));
+        assert_eq!(document.selected_scene, 0);
+        assert_eq!(document.scenes[0].id, first);
+    }
+
+    #[test]
+    fn transition_progress_and_duration_clamping() {
+        let cut = Transition::default();
+        assert_eq!(cut.kind, TransitionKind::Cut);
+        assert_eq!(cut.progress(0), 1.0);
+        assert_eq!(cut.progress(9999), 1.0);
+
+        let fade = Transition {
+            kind: TransitionKind::Fade,
+            duration_ms: 100,
+        };
+        assert_eq!(fade.progress(0), 0.0);
+        assert!((fade.progress(50) - 0.5).abs() < 0.001);
+        assert_eq!(fade.progress(100), 1.0);
+        assert_eq!(fade.progress(500), 1.0);
+
+        let long = Transition {
+            kind: TransitionKind::Fade,
+            duration_ms: 99_999,
+        };
+        assert_eq!(long.duration_ms(), 10_000);
+        assert_eq!(long.progress(10_000), 1.0);
+    }
+
+    #[test]
+    fn schema_one_json_without_transition_still_loads() {
+        let old = r#"{
+            "title": "Legacy",
+            "scenes": [{ "id": 1, "name": "Scene 1", "sources": [] }],
+            "selected_scene": 0,
+            "next_id": 2
+        }"#;
+        let document: Document = serde_json::from_str(old).expect("legacy schema-1 document");
+        assert_eq!(document.scenes[0].transition, Transition::default());
+        let json = serde_json::to_string(&document).expect("serialize");
+        let round_trip: Document = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(document, round_trip);
     }
 
     #[test]

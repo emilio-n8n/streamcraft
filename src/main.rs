@@ -3,8 +3,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod audio;
+mod capture;
 mod document;
+mod recording;
 mod render;
+mod webcam;
 
 use craftkit_ui::cli::{self, CliAction};
 use craftkit_ui::{WindowOptions, run_native};

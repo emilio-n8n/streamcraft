@@ -1386,6 +1386,10 @@ impl eframe::App for StreamCraftApp {
         self.handle_shortcuts(ui);
         self.poll_capture(&ctx);
         self.poll_recording();
+        if self.recording.is_some() {
+            let interval = Duration::from_millis(u64::from(1000 / self.record_fps.max(1)));
+            ctx.request_repaint_after(interval);
+        }
         self.top_bar(ui);
         self.status_bar(ui);
         self.scenes_panel(ui);

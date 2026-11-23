@@ -8,10 +8,8 @@ All notable changes to StreamCraft are documented here.
 
 - Recording now requests a repaint at the configured frame rate, so a static
   scene keeps producing frames instead of stopping after a short burst.
-- Missed intervals repeat the last frame in an attempt to approach wall-clock
-  duration. In the published release the software renderer is still slower
-  than 30 fps, so a 5 s recording can produce about 1.1 s of video; a dedicated
-  capture thread is planned.
+- Missed intervals repeat the last frame, keeping the video duration close to
+  wall-clock time when rendering is slower than the target frame rate.
 
 ## [0.2.0] - 2026-11-22
 

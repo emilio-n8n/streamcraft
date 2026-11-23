@@ -2,7 +2,7 @@
 
 All notable changes to StreamCraft are documented here.
 
-## [0.2.1] - 2026-11-23
+## [0.2.2] - 2026-11-23
 
 ### Fixed
 

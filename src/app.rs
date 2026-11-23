@@ -537,10 +537,16 @@ impl StreamCraftApp {
 
     fn poll_recording(&mut self) {
         let interval = Duration::from_millis(u64::from(1000 / self.record_fps.max(1)));
-        if self.record_last_frame.elapsed() < interval {
+        let elapsed = self.record_last_frame.elapsed();
+        if elapsed < interval {
             return;
         }
-        self.record_last_frame = Instant::now();
+        // Rendering can be slower than the target frame rate. Repeat the frame
+        // for every missed interval so the video keeps wall-clock duration.
+        let due = (elapsed.as_secs_f64() / interval.as_secs_f64())
+            .floor()
+            .clamp(1.0, 30.0) as u32;
+        self.record_last_frame += interval * due;
         let Some(session) = self.recording.as_mut() else {
             return;
         };
@@ -548,9 +554,12 @@ impl StreamCraftApp {
             return;
         };
         let png = render_scene_png(&scene);
-        if let Err(error) = session.push_frame(&png) {
-            self.shell.notify(Tone::Error, "Recording stopped", error);
-            self.recording = None;
+        for _ in 0..due {
+            if let Err(error) = session.push_frame(&png) {
+                self.shell.notify(Tone::Error, "Recording stopped", error);
+                self.recording = None;
+                break;
+            }
         }
     }
 

@@ -2,6 +2,13 @@
 
 All notable changes to StreamCraft are documented here.
 
+## [0.2.1] - 2026-11-23
+
+### Fixed
+
+- Recording now requests a repaint at the configured frame rate, so a static
+  scene keeps producing frames instead of stopping after a short burst.
+
 ## [0.2.0] - 2026-11-22
 
 ### Added

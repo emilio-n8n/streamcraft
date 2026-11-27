@@ -58,26 +58,20 @@ impl Framebuffer {
         }
     }
 
-    fn draw_source(&mut self, source: &Source) {
-        if !source.visible || source.opacity <= 0.0 {
+    fn draw_source(&mut self, source: &Source, scene_opacity: f32) {
+        let opacity = source.opacity * scene_opacity;
+        if !source.visible || !opacity.is_finite() || opacity <= 0.0 {
             return;
         }
         let (x, y, w, h) = source.rect();
         match source.kind {
-            SourceKind::Color => self.fill_rect(x, y, w, h, source.color, source.opacity),
+            SourceKind::Color => self.fill_rect(x, y, w, h, source.color, opacity),
             SourceKind::TestPattern => {
                 let top_h = h * 2.0 / 3.0;
                 let bottom_h = h - top_h;
                 let bar_w = w / SMPTE_BARS.len() as f32;
                 for (index, color) in SMPTE_BARS.iter().enumerate() {
-                    self.fill_rect(
-                        x + index as f32 * bar_w,
-                        y,
-                        bar_w,
-                        top_h,
-                        *color,
-                        source.opacity,
-                    );
+                    self.fill_rect(x + index as f32 * bar_w, y, bar_w, top_h, *color, opacity);
                 }
                 let bottom_w = w / SMPTE_LOWER.len() as f32;
                 for (index, color) in SMPTE_LOWER.iter().enumerate() {
@@ -87,7 +81,7 @@ impl Framebuffer {
                         bottom_w,
                         bottom_h,
                         *color,
-                        source.opacity,
+                        opacity,
                     );
                 }
             }
@@ -117,7 +111,7 @@ impl Framebuffer {
                                         scale as f32,
                                         scale as f32,
                                         source.color,
-                                        source.opacity,
+                                        opacity,
                                     );
                                 }
                             }
@@ -126,6 +120,15 @@ impl Framebuffer {
                     cursor_x += i32::try_from(4 * scale).unwrap_or(64);
                 }
             }
+        }
+    }
+
+    fn draw_scene(&mut self, scene: &Scene, opacity: f32) {
+        if !opacity.is_finite() || opacity <= 0.0 {
+            return;
+        }
+        for source in &scene.sources {
+            self.draw_source(source, opacity);
         }
     }
 }
@@ -212,87 +215,203 @@ const fn crc_table() -> [u32; 256] {
 
 static CRC_TABLE: [u32; 256] = crc_table();
 
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFF_u32;
+fn update_crc32(mut crc: u32, data: &[u8]) -> u32 {
     for &byte in data {
         crc = CRC_TABLE[((crc ^ u32::from(byte)) & 0xFF) as usize] ^ (crc >> 8);
     }
-    !crc
-}
-
-fn adler32(data: &[u8]) -> u32 {
-    const MOD: u32 = 65_521;
-    let mut a = 1_u32;
-    let mut b = 0_u32;
-    for &byte in data {
-        a = (a + u32::from(byte)) % MOD;
-        b = (b + a) % MOD;
-    }
-    (b << 16) | a
+    crc
 }
 
 fn push_chunk(output: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     output.extend_from_slice(&(data.len() as u32).to_be_bytes());
     output.extend_from_slice(kind);
     output.extend_from_slice(data);
-    let mut crc_input = Vec::with_capacity(4 + data.len());
-    crc_input.extend_from_slice(kind);
-    crc_input.extend_from_slice(data);
-    output.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    let mut crc = update_crc32(0xFFFF_FFFF, kind);
+    crc = update_crc32(crc, data);
+    output.extend_from_slice(&(!crc).to_be_bytes());
+}
+
+#[derive(Default)]
+struct Adler32 {
+    a: u32,
+    b: u32,
+}
+
+impl Adler32 {
+    fn new() -> Self {
+        Self { a: 1, b: 0 }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        const MOD: u32 = 65_521;
+        for &byte in data {
+            self.a = (self.a + u32::from(byte)) % MOD;
+            self.b = (self.b + self.a) % MOD;
+        }
+    }
+
+    const fn finish(self) -> u32 {
+        (self.b << 16) | self.a
+    }
+}
+
+fn flush_stored_block(output: &mut Vec<u8>, crc: &mut u32, block: &mut Vec<u8>, final_block: bool) {
+    let length = block.len() as u16;
+    let header = [
+        u8::from(final_block),
+        length as u8,
+        (length >> 8) as u8,
+        !length as u8,
+        (!(length >> 8)) as u8,
+    ];
+    output.extend_from_slice(&header);
+    output.extend_from_slice(block);
+    *crc = update_crc32(update_crc32(*crc, &header), block);
+    block.clear();
+}
+
+fn append_stored_bytes(
+    output: &mut Vec<u8>,
+    crc: &mut u32,
+    block: &mut Vec<u8>,
+    adler: &mut Adler32,
+    data: &[u8],
+) {
+    adler.update(data);
+    for &byte in data {
+        if block.len() == u16::MAX as usize {
+            flush_stored_block(output, crc, block, false);
+        }
+        block.push(byte);
+    }
 }
 
 /// Encode a packed RGBA buffer as a PNG image with uncompressed DEFLATE blocks.
 ///
 /// The result is a valid, portable PNG (8-bit RGBA, no interlace); stored
-/// blocks keep the encoder small and deterministic.
+/// blocks keep the encoder small and deterministic. Invalid dimensions or a
+/// mismatched pixel buffer produce an empty vector. The encoder writes IDAT
+/// incrementally, avoiding full-size raw, compressed and CRC copies.
 #[must_use]
 pub fn encode_png(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let row_bytes = width as usize * 4;
-    let mut raw = Vec::with_capacity((row_bytes + 1) * height as usize);
-    for row in 0..height as usize {
-        raw.push(0); // filter type: None
-        let start = row * row_bytes;
-        raw.extend_from_slice(&pixels[start..start + row_bytes]);
+    let Some(row_bytes) = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+    else {
+        return Vec::new();
+    };
+    let Some(pixel_bytes) = row_bytes.checked_mul(usize::try_from(height).unwrap_or(usize::MAX))
+    else {
+        return Vec::new();
+    };
+    let Some(raw_len) = pixel_bytes.checked_add(usize::try_from(height).unwrap_or(usize::MAX))
+    else {
+        return Vec::new();
+    };
+    if width == 0 || height == 0 || pixels.len() != pixel_bytes {
+        return Vec::new();
     }
+    let block_count = raw_len.div_ceil(u16::MAX as usize).max(1);
+    let Some(idat_len) = raw_len
+        .checked_add(block_count.saturating_mul(5))
+        .and_then(|length| length.checked_add(6))
+    else {
+        return Vec::new();
+    };
+    let Ok(idat_len32) = u32::try_from(idat_len) else {
+        return Vec::new();
+    };
+    let Some(allocation) = idat_len.checked_add(57) else {
+        return Vec::new();
+    };
 
-    // zlib wrapper (RFC 1950) around a stream of stored DEFLATE blocks.
-    let mut compressed = vec![0x78, 0x01];
-    let mut offset = 0;
-    while offset < raw.len() {
-        let length = (raw.len() - offset).min(u16::MAX as usize);
-        let final_block = u8::from(offset + length == raw.len());
-        let length = length as u16;
-        compressed.push(final_block);
-        compressed.extend_from_slice(&length.to_le_bytes());
-        compressed.extend_from_slice(&(!length).to_le_bytes());
-        compressed.extend_from_slice(&raw[offset..offset + usize::from(length)]);
-        offset += usize::from(length);
-    }
-    compressed.extend_from_slice(&adler32(&raw).to_be_bytes());
-
-    let mut output = Vec::with_capacity(compressed.len() + 57);
+    let mut output = Vec::with_capacity(allocation);
     output.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
     let mut ihdr = Vec::with_capacity(13);
     ihdr.extend_from_slice(&width.to_be_bytes());
     ihdr.extend_from_slice(&height.to_be_bytes());
     ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
     push_chunk(&mut output, b"IHDR", &ihdr);
-    push_chunk(&mut output, b"IDAT", &compressed);
+    output.extend_from_slice(&idat_len32.to_be_bytes());
+    output.extend_from_slice(b"IDAT");
+    let mut crc = update_crc32(0xFFFF_FFFF, b"IDAT");
+    let zlib_header = [0x78, 0x01];
+    output.extend_from_slice(&zlib_header);
+    crc = update_crc32(crc, &zlib_header);
+
+    let mut block = Vec::with_capacity(u16::MAX as usize);
+    let mut adler = Adler32::new();
+    for row in 0..usize::try_from(height).unwrap_or(usize::MAX) {
+        append_stored_bytes(&mut output, &mut crc, &mut block, &mut adler, &[0]);
+        let start = row * row_bytes;
+        append_stored_bytes(
+            &mut output,
+            &mut crc,
+            &mut block,
+            &mut adler,
+            &pixels[start..start + row_bytes],
+        );
+    }
+    flush_stored_block(&mut output, &mut crc, &mut block, true);
+    let checksum = adler.finish().to_be_bytes();
+    output.extend_from_slice(&checksum);
+    crc = update_crc32(crc, &checksum);
+    output.extend_from_slice(&(!crc).to_be_bytes());
     push_chunk(&mut output, b"IEND", &[]);
     output
+}
+
+fn render_scene_rgba(scene: &Scene) -> Vec<u8> {
+    let mut framebuffer = Framebuffer::new(CANVAS_W as usize, CANVAS_H as usize);
+    framebuffer.fill_rect(0.0, 0.0, CANVAS_W, CANVAS_H, Color::rgb(0, 0, 0), 1.0);
+    framebuffer.draw_scene(scene, 1.0);
+    framebuffer.pixels
 }
 
 /// Render a scene to a PNG image of the logical canvas size.
 #[must_use]
 pub fn render_scene_png(scene: &Scene) -> Vec<u8> {
-    let width = CANVAS_W as usize;
-    let height = CANVAS_H as usize;
-    let mut framebuffer = Framebuffer::new(width, height);
-    framebuffer.fill_rect(0.0, 0.0, CANVAS_W, CANVAS_H, Color::rgb(0, 0, 0), 1.0);
-    for source in &scene.sources {
-        framebuffer.draw_source(source);
-    }
-    encode_png(&framebuffer.pixels, CANVAS_W as u32, CANVAS_H as u32)
+    encode_png(&render_scene_rgba(scene), CANVAS_W as u32, CANVAS_H as u32)
+}
+
+fn blend_rgba(from: &[u8], to: &[u8], progress: f32) -> Vec<u8> {
+    let progress = if progress.is_finite() {
+        progress.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    from.as_chunks::<4>()
+        .0
+        .iter()
+        .zip(to.as_chunks::<4>().0.iter())
+        .flat_map(|(outgoing, incoming)| {
+            let inverse = 1.0 - progress;
+            [
+                (f32::from(outgoing[0]) * inverse + f32::from(incoming[0]) * progress).round()
+                    as u8,
+                (f32::from(outgoing[1]) * inverse + f32::from(incoming[1]) * progress).round()
+                    as u8,
+                (f32::from(outgoing[2]) * inverse + f32::from(incoming[2]) * progress).round()
+                    as u8,
+                255,
+            ]
+        })
+        .collect()
+}
+
+/// Render a true cross-fade between two scenes as a PNG frame.
+///
+/// `progress` is clamped to `0.0..=1.0`: zero shows the outgoing scene, one
+/// shows the incoming scene, and intermediate values blend both framebuffers.
+#[must_use]
+pub fn render_transition_png(from: &Scene, to: &Scene, progress: f32) -> Vec<u8> {
+    let outgoing = render_scene_rgba(from);
+    let incoming = render_scene_rgba(to);
+    encode_png(
+        &blend_rgba(&outgoing, &incoming, progress),
+        CANVAS_W as u32,
+        CANVAS_H as u32,
+    )
 }
 
 #[cfg(test)]
@@ -320,6 +439,32 @@ mod tests {
         chunks
     }
 
+    fn assert_valid_chunk_crcs(png: &[u8]) {
+        let mut offset = 8;
+        while offset + 12 <= png.len() {
+            let length =
+                u32::from_be_bytes(png[offset..offset + 4].try_into().expect("length")) as usize;
+            let kind = &png[offset + 4..offset + 8];
+            let data = &png[offset + 8..offset + 8 + length];
+            let stored = u32::from_be_bytes(
+                png[offset + 8 + length..offset + 12 + length]
+                    .try_into()
+                    .expect("CRC"),
+            );
+            let crc = update_crc32(update_crc32(0xFFFF_FFFF, kind), data);
+            assert_eq!(stored, !crc);
+            offset += 12 + length;
+        }
+        assert_eq!(offset, png.len());
+    }
+
+    #[test]
+    fn png_encoder_rejects_invalid_buffers() {
+        assert!(encode_png(&[0, 0, 0, 0], 0, 1).is_empty());
+        assert!(encode_png(&[0, 0, 0], 1, 1).is_empty());
+        assert!(encode_png(&[], u32::MAX, u32::MAX).is_empty());
+    }
+
     #[test]
     fn sample_scene_exports_a_valid_non_empty_png() {
         let scene = Document::sample();
@@ -327,6 +472,7 @@ mod tests {
         let png = render_scene_png(scene);
         assert!(png.len() > 1000);
         assert_eq!(&png[..8], &SIGNATURE);
+        assert_valid_chunk_crcs(&png);
 
         let chunks = chunk_lengths(&png);
         assert_eq!(chunks.len(), 3);
@@ -371,10 +517,49 @@ mod tests {
         let mut framebuffer = Framebuffer::new(100, 100);
         framebuffer.fill_rect(0.0, 0.0, 100.0, 100.0, Color::rgb(0, 0, 0), 1.0);
         for source in &scene.sources {
-            framebuffer.draw_source(source);
+            framebuffer.draw_source(source, 1.0);
         }
         let pixel = &framebuffer.pixels[50 * 4..50 * 4 + 4];
         assert_eq!(pixel, &[128, 0, 128, 255]);
+    }
+
+    #[test]
+    fn transition_renderer_blends_outgoing_and_incoming_scenes() {
+        let mut from_document = Document::default();
+        let mut to_document = Document::default();
+        for (document, color) in [
+            (&mut from_document, Color::rgb(255, 0, 0)),
+            (&mut to_document, Color::rgb(0, 0, 255)),
+        ] {
+            let id = document.add_source(SourceKind::Color).expect("source");
+            if let Some(source) = document
+                .selected_scene_mut()
+                .and_then(|scene| scene.source_mut(id))
+            {
+                source.x = 0.0;
+                source.y = 0.0;
+                source.w = 1.0;
+                source.h = 1.0;
+                source.color = color;
+            }
+        }
+        let from = from_document.selected_scene().expect("outgoing scene");
+        let to = to_document.selected_scene().expect("incoming scene");
+        let blended = blend_rgba(&render_scene_rgba(from), &render_scene_rgba(to), 0.5);
+        assert_eq!(&blended[..4], &[128, 0, 128, 255]);
+        assert!(render_transition_png(from, to, 0.5).starts_with(&SIGNATURE));
+        assert_eq!(
+            blend_rgba(&[255, 0, 0, 255], &[0, 0, 255, 255], 0.5),
+            [128, 0, 128, 255]
+        );
+        assert_eq!(
+            blend_rgba(&[255, 0, 0, 255], &[0, 0, 255, 255], 0.0),
+            [255, 0, 0, 255]
+        );
+        assert_eq!(
+            blend_rgba(&[255, 0, 0, 255], &[0, 0, 255, 255], 1.0),
+            [0, 0, 255, 255]
+        );
     }
 
     #[test]

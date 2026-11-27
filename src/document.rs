@@ -5,6 +5,8 @@
 //! the same scene reusable for on-screen composition, SVG export and raster
 //! export.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 /// Logical width of the composition canvas, in pixels.
@@ -122,6 +124,10 @@ fn default_visible() -> bool {
     true
 }
 
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() { value } else { fallback }
+}
+
 impl Source {
     /// Create a source with sensible defaults for its kind.
     #[must_use]
@@ -152,11 +158,11 @@ impl Source {
     /// dimensions; the origin is then clamped so the whole source stays inside
     /// the canvas. Opacity is clamped to `0.0..=1.0`.
     pub fn clamp_to_canvas(&mut self) {
-        self.w = self.w.clamp(MIN_SOURCE_SIZE, CANVAS_W);
-        self.h = self.h.clamp(MIN_SOURCE_SIZE, CANVAS_H);
-        self.x = self.x.clamp(0.0, CANVAS_W - self.w);
-        self.y = self.y.clamp(0.0, CANVAS_H - self.h);
-        self.opacity = self.opacity.clamp(0.0, 1.0);
+        self.w = finite_or(self.w, 320.0).clamp(MIN_SOURCE_SIZE, CANVAS_W);
+        self.h = finite_or(self.h, 180.0).clamp(MIN_SOURCE_SIZE, CANVAS_H);
+        self.x = finite_or(self.x, 0.0).clamp(0.0, CANVAS_W - self.w);
+        self.y = finite_or(self.y, 0.0).clamp(0.0, CANVAS_H - self.h);
+        self.opacity = finite_or(self.opacity, 0.0).clamp(0.0, 1.0);
     }
 
     /// Rectangle `(x, y, w, h)` in canvas coordinates.
@@ -316,7 +322,8 @@ impl Scene {
                 continue;
             }
             let (x, y, w, h) = source.rect();
-            out.push_str(&format!("<g opacity=\"{:.3}\">\n", source.opacity));
+            let opacity = finite_or(source.opacity, 0.0).clamp(0.0, 1.0);
+            out.push_str(&format!("<g opacity=\"{opacity:.3}\">\n"));
             match source.kind {
                 SourceKind::Color => {
                     out.push_str(&rectangle(x, y, w, h, &source.color.hex()));
@@ -390,6 +397,7 @@ fn escape_xml(text: &str) -> String {
 
 /// A versioned scene-composition project.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "DocumentData")]
 pub struct Document {
     /// Project title.
     pub title: String,
@@ -399,6 +407,55 @@ pub struct Document {
     pub selected_scene: usize,
     /// Next identifier handed out by [`Document::alloc_id`].
     pub next_id: u64,
+}
+
+#[derive(Deserialize)]
+struct DocumentData {
+    title: String,
+    scenes: Vec<Scene>,
+    selected_scene: usize,
+    next_id: u64,
+}
+
+impl TryFrom<DocumentData> for Document {
+    type Error = String;
+
+    fn try_from(data: DocumentData) -> Result<Self, Self::Error> {
+        if data.scenes.is_empty() {
+            return Err("document must contain at least one scene".to_owned());
+        }
+        if data.selected_scene >= data.scenes.len() {
+            return Err("selected scene is outside the scene list".to_owned());
+        }
+        let mut document = Self {
+            title: data.title,
+            scenes: data.scenes,
+            selected_scene: data.selected_scene,
+            next_id: data.next_id,
+        };
+        let mut identifiers = HashSet::new();
+        let mut maximum_id = 0_u64;
+        for scene in &mut document.scenes {
+            if !identifiers.insert(scene.id) {
+                return Err(format!("duplicate scene identifier {}", scene.id));
+            }
+            maximum_id = maximum_id.max(scene.id);
+            for source in &mut scene.sources {
+                if !identifiers.insert(source.id) {
+                    return Err(format!("duplicate source identifier {}", source.id));
+                }
+                maximum_id = maximum_id.max(source.id);
+                source.clamp_to_canvas();
+            }
+        }
+        if maximum_id == u64::MAX || document.next_id == u64::MAX {
+            return Err("document identifier space is exhausted".to_owned());
+        }
+        // Older or hand-edited files can have a stale counter. Advance it
+        // instead of allowing the next source to reuse an existing identifier.
+        document.next_id = document.next_id.max(maximum_id.saturating_add(1));
+        Ok(document)
+    }
 }
 
 impl Default for Document {
@@ -700,6 +757,87 @@ mod tests {
     }
 
     #[test]
+    fn deserialization_repairs_geometry_and_stale_identifiers() {
+        let json = r#"{
+            "title": "Hand edited",
+            "scenes": [{
+                "id": 1,
+                "name": "Scene 1",
+                "sources": [{
+                    "id": 7,
+                    "name": "Bad geometry",
+                    "kind": "Color",
+                    "x": -10.0,
+                    "y": 900.0,
+                    "w": -5.0,
+                    "h": 2.0,
+                    "opacity": 4.0,
+                    "text": "",
+                    "color": {"r": 1, "g": 2, "b": 3, "a": 255}
+                }]
+            }],
+            "selected_scene": 0,
+            "next_id": 2
+        }"#;
+        let mut document: Document = serde_json::from_str(json).expect("valid JSON document");
+        let source = document.source(7).expect("source");
+        assert_eq!(
+            source.rect(),
+            (0.0, 704.0, MIN_SOURCE_SIZE, MIN_SOURCE_SIZE)
+        );
+        assert_eq!(source.opacity, 1.0);
+        assert_eq!(document.next_id, 8);
+        let added = document.add_source(SourceKind::Color).expect("new source");
+        assert_eq!(added, 8);
+    }
+
+    #[test]
+    fn deserialization_rejects_ambiguous_or_unusable_documents() {
+        let base = r#"{
+            "title": "Invalid",
+            "scenes": [{"id": 1, "name": "Scene 1", "sources": []}],
+            "selected_scene": 0,
+            "next_id": 2
+        }"#;
+        assert!(serde_json::from_str::<Document>(base).is_ok());
+        assert!(
+            serde_json::from_str::<Document>(
+                &base.replace("\"selected_scene\": 0", "\"selected_scene\": 9")
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Document>(
+                &base.replace("\"next_id\": 2", "\"next_id\": 18446744073709551615")
+            )
+            .is_err()
+        );
+        let duplicate = r#"{
+            "title": "Duplicate",
+            "scenes": [
+                {"id": 1, "name": "One", "sources": []},
+                {"id": 1, "name": "Two", "sources": []}
+            ],
+            "selected_scene": 0,
+            "next_id": 2
+        }"#;
+        assert!(serde_json::from_str::<Document>(duplicate).is_err());
+    }
+
+    #[test]
+    fn transform_clamping_rejects_non_finite_values() {
+        let mut source = Source::new(1, "Non-finite", SourceKind::Color);
+        source.x = f32::NAN;
+        source.y = f32::INFINITY;
+        source.w = f32::NEG_INFINITY;
+        source.h = f32::NAN;
+        source.opacity = f32::NAN;
+        source.clamp_to_canvas();
+        assert_eq!(source.rect(), (0.0, 0.0, 320.0, 180.0));
+        assert_eq!(source.opacity, 0.0);
+    }
+
+    #[test]
     fn removing_the_last_scene_keeps_an_empty_scene() {
         let mut document = Document::default();
         assert!(document.remove_scene(0));
@@ -830,6 +968,41 @@ mod tests {
         assert_eq!(history.current().source(id).expect("source").rect(), before);
         assert!(history.redo());
         assert_eq!(history.current().source(id).expect("source").rect(), moved);
+    }
+
+    #[test]
+    fn transition_duration_gesture_is_one_undo_step() {
+        let mut history = History::new(Document::default());
+        history.begin_gesture();
+        for duration in [100, 200, 300, 400] {
+            if let Some(scene) = history.current_mut().selected_scene_mut() {
+                scene.transition = Transition {
+                    kind: TransitionKind::Fade,
+                    duration_ms: duration,
+                };
+            }
+        }
+        history.end_gesture();
+        assert_eq!(history.undo_depth(), 1);
+        assert!(history.undo());
+        assert_eq!(
+            history
+                .current()
+                .selected_scene()
+                .expect("scene")
+                .transition,
+            Transition::default()
+        );
+        assert!(history.redo());
+        assert_eq!(
+            history
+                .current()
+                .selected_scene()
+                .expect("scene")
+                .transition
+                .duration_ms,
+            400
+        );
     }
 
     #[test]

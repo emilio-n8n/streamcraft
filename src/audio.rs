@@ -4,8 +4,8 @@
 //! reads that slot. Device discovery is best-effort: on a machine without an
 //! input device the status is reported as unavailable rather than faked.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -23,14 +23,27 @@ impl AudioLevel {
     /// Publish a new level, clamped to `0.0..=1.0`.
     #[cfg(test)]
     pub fn set(&self, level: f32) {
-        self.0
-            .store(level.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        self.publish(level);
+    }
+
+    fn publish(&self, level: f32) {
+        let level = if level.is_finite() {
+            level.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.0.store(level.to_bits(), Ordering::Relaxed);
     }
 
     /// Current level.
     #[must_use]
     pub fn get(&self) -> f32 {
-        f32::from_bits(self.0.load(Ordering::Relaxed)).clamp(0.0, 1.0)
+        let level = f32::from_bits(self.0.load(Ordering::Relaxed));
+        if level.is_finite() {
+            level.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
     }
 }
 
@@ -74,11 +87,49 @@ impl AudioStatus {
     }
 }
 
+#[derive(Debug, Default)]
+struct AudioFailureState {
+    failed: AtomicBool,
+    message: Mutex<Option<String>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AudioFailure(Arc<AudioFailureState>);
+
+impl AudioFailure {
+    fn report(&self, error: impl std::fmt::Display) {
+        if let Ok(mut slot) = self.0.message.lock() {
+            *slot = Some(error.to_string());
+        }
+        self.0.failed.store(true, Ordering::Release);
+    }
+
+    fn clear(&self) {
+        // The normal audio callback only touches an atomic. The mutex is used
+        // solely on the error/recovery transition, never for every sample block.
+        if self.0.failed.load(Ordering::Relaxed)
+            && self.0.failed.swap(false, Ordering::AcqRel)
+            && let Ok(mut slot) = self.0.message.lock()
+            && !self.0.failed.load(Ordering::Acquire)
+        {
+            *slot = None;
+        }
+    }
+
+    fn get(&self) -> Option<String> {
+        if !self.0.failed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.0.message.lock().ok().and_then(|slot| slot.clone())
+    }
+}
+
 /// A live microphone monitor. Keeps the `cpal` stream alive while in scope.
 pub struct AudioMonitor {
     _stream: Option<cpal::Stream>,
     level: AudioLevel,
     status: AudioStatus,
+    failure: AudioFailure,
 }
 
 impl AudioMonitor {
@@ -87,7 +138,8 @@ impl AudioMonitor {
     #[must_use]
     pub fn start() -> Self {
         let level = AudioLevel::new();
-        let (stream, status) = match Self::try_start(&level) {
+        let failure = AudioFailure::default();
+        let (stream, status) = match Self::try_start(&level, &failure) {
             Ok((stream, device)) => (Some(stream), AudioStatus::Running(device)),
             Err(error) => (None, AudioStatus::Unavailable(error.to_string())),
         };
@@ -95,10 +147,14 @@ impl AudioMonitor {
             _stream: stream,
             level,
             status,
+            failure,
         }
     }
 
-    fn try_start(level: &AudioLevel) -> Result<(cpal::Stream, String), AudioError> {
+    fn try_start(
+        level: &AudioLevel,
+        failure: &AudioFailure,
+    ) -> Result<(cpal::Stream, String), AudioError> {
         let host = cpal::default_host();
         let device = host.default_input_device().ok_or(AudioError::NoDevice)?;
         let name = device.to_string();
@@ -107,43 +163,61 @@ impl AudioMonitor {
             .map_err(|error| AudioError::Configuration(error.to_string()))?;
         let sample_format = config.sample_format();
         let stream_config: cpal::StreamConfig = config.into();
-        let callback_level = Arc::clone(&level.0);
-
         let stream = match sample_format {
-            cpal::SampleFormat::F32 => device.build_input_stream(
-                stream_config,
-                move |data: &[f32], _| {
-                    callback_level.store(rms_f32(data).to_bits(), Ordering::Relaxed);
-                },
-                |error| eprintln!("microphone input error: {error}"),
-                None,
-            ),
-            cpal::SampleFormat::I16 => device.build_input_stream(
-                stream_config,
-                move |data: &[i16], _| {
-                    let peak = data
-                        .iter()
-                        .copied()
-                        .map(|sample| f32::from(sample) / f32::from(i16::MAX))
-                        .fold(0.0_f32, f32::max);
-                    callback_level.store(peak.abs().to_bits(), Ordering::Relaxed);
-                },
-                |error| eprintln!("microphone input error: {error}"),
-                None,
-            ),
-            cpal::SampleFormat::U8 => device.build_input_stream(
-                stream_config,
-                move |data: &[u8], _| {
-                    let peak = data
-                        .iter()
-                        .copied()
-                        .map(|sample| (f32::from(sample) - 128.0) / 128.0)
-                        .fold(0.0_f32, f32::max);
-                    callback_level.store(peak.abs().to_bits(), Ordering::Relaxed);
-                },
-                |error| eprintln!("microphone input error: {error}"),
-                None,
-            ),
+            cpal::SampleFormat::F32 => {
+                let callback_level = level.clone();
+                let error_level = callback_level.clone();
+                let callback_failure = failure.clone();
+                let error_failure = failure.clone();
+                device.build_input_stream(
+                    stream_config,
+                    move |data: &[f32], _| {
+                        callback_failure.clear();
+                        callback_level.publish(rms_f32(data));
+                    },
+                    move |error| {
+                        error_level.publish(0.0);
+                        error_failure.report(error);
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::I16 => {
+                let callback_level = level.clone();
+                let error_level = callback_level.clone();
+                let callback_failure = failure.clone();
+                let error_failure = failure.clone();
+                device.build_input_stream(
+                    stream_config,
+                    move |data: &[i16], _| {
+                        callback_failure.clear();
+                        callback_level.publish(rms_i16(data));
+                    },
+                    move |error| {
+                        error_level.publish(0.0);
+                        error_failure.report(error);
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::U8 => {
+                let callback_level = level.clone();
+                let error_level = callback_level.clone();
+                let callback_failure = failure.clone();
+                let error_failure = failure.clone();
+                device.build_input_stream(
+                    stream_config,
+                    move |data: &[u8], _| {
+                        callback_failure.clear();
+                        callback_level.publish(rms_u8(data));
+                    },
+                    move |error| {
+                        error_level.publish(0.0);
+                        error_failure.report(error);
+                    },
+                    None,
+                )
+            }
             _ => {
                 return Err(AudioError::Configuration(format!(
                     "unsupported sample format {sample_format:?}"
@@ -164,21 +238,61 @@ impl AudioMonitor {
         self.level.get()
     }
 
-    /// Current monitoring status.
+    /// Current monitoring status, including asynchronous device errors.
     #[must_use]
-    pub fn status(&self) -> &AudioStatus {
-        &self.status
+    pub fn status(&self) -> AudioStatus {
+        self.failure.get().map_or_else(
+            || self.status.clone(),
+            |error| AudioStatus::Unavailable(format!("input stream error: {error}")),
+        )
     }
 }
 
 /// Root-mean-square of a floating-point sample block.
+///
+/// Non-finite samples are ignored so a faulty device cannot put `NaN` into the
+/// meter. Arithmetic uses `f64` to avoid overflow while squaring.
 #[must_use]
 pub fn rms_f32(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
+    let mut sum = 0.0_f64;
+    let mut count = 0_usize;
+    for &sample in samples {
+        if sample.is_finite() {
+            sum += f64::from(sample) * f64::from(sample);
+            count += 1;
+        }
     }
-    let sum: f32 = samples.iter().map(|sample| sample * sample).sum();
-    (sum / samples.len() as f32).sqrt()
+    rms_from_sum(sum, count)
+}
+
+/// Root-mean-square of signed 16-bit samples, normalized to `-1.0..=1.0`.
+#[must_use]
+pub fn rms_i16(samples: &[i16]) -> f32 {
+    let mut sum = 0.0_f64;
+    for &sample in samples {
+        let sample = f64::from(sample) / 32_768.0;
+        sum += sample * sample;
+    }
+    rms_from_sum(sum, samples.len())
+}
+
+/// Root-mean-square of unsigned 8-bit samples, centered at 128.
+#[must_use]
+pub fn rms_u8(samples: &[u8]) -> f32 {
+    let mut sum = 0.0_f64;
+    for &sample in samples {
+        let sample = (f64::from(sample) - 128.0) / 128.0;
+        sum += sample * sample;
+    }
+    rms_from_sum(sum, samples.len())
+}
+
+fn rms_from_sum(sum: f64, count: usize) -> f32 {
+    if count == 0 {
+        0.0
+    } else {
+        (sum / count as f64).sqrt() as f32
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +307,20 @@ mod tests {
     }
 
     #[test]
+    fn integer_formats_use_rms_instead_of_peak() {
+        assert!((rms_i16(&[i16::MIN, 0]) - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.0001);
+        assert!((rms_u8(&[128, 192]) - std::f32::consts::FRAC_1_SQRT_2 * 0.5).abs() < 0.0001);
+        assert_eq!(rms_i16(&[]), 0.0);
+        assert_eq!(rms_u8(&[]), 0.0);
+    }
+
+    #[test]
+    fn rms_ignores_non_finite_samples() {
+        assert_eq!(rms_f32(&[f32::NAN, f32::INFINITY]), 0.0);
+        assert!((rms_f32(&[3.0, f32::NAN, 4.0]) - 12.5_f32.sqrt()).abs() < 0.0001);
+    }
+
+    #[test]
     fn level_is_clamped_and_shared() {
         let level = AudioLevel::new();
         let handle = level.clone();
@@ -202,6 +330,25 @@ mod tests {
         assert_eq!(level.get(), 0.0);
         handle.set(0.25);
         assert_eq!(level.get(), 0.25);
+        handle.set(f32::NAN);
+        assert_eq!(level.get(), 0.0);
+    }
+
+    #[test]
+    fn asynchronous_errors_are_visible_and_recoverable() {
+        let failure = AudioFailure::default();
+        let handle = failure.clone();
+        handle.report("device disconnected");
+        assert_eq!(failure.get().as_deref(), Some("device disconnected"));
+        handle.clear();
+        assert_eq!(failure.get(), None);
+    }
+
+    #[test]
+    fn missing_device_is_reported_without_panicking() {
+        let monitor = AudioMonitor::start();
+        assert!(monitor.level().is_finite());
+        assert!(!monitor.status().label().is_empty());
     }
 
     #[test]

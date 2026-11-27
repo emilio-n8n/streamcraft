@@ -17,11 +17,14 @@ desktop foundation.
 - Scene transitions (cut / fade) on scene activation, with keyboard shortcuts
   (PageUp/PageDown for scenes, F11 for fullscreen, Ctrl+R to record).
 - Screen/window capture preview on Linux/X11 via `x11rb`, behind a
-  `CaptureBackend` abstraction. Other platforms report an explicit
-  "unsupported" status rather than faking a preview.
-- Microphone level meter using `cpal` (reports "no device" when absent).
-- Local recording: MKV/MP4 through `ffmpeg` when it is on `PATH`; otherwise a
-  numbered PNG sequence that can be muxed later.
+  `CaptureBackend` abstraction, with reconnect, target refresh and bounded
+  frame validation. Other platforms report an explicit "unsupported" status
+  rather than faking a preview.
+- Microphone RMS level meter using `cpal` for floating-point and integer
+  devices (reports missing devices and asynchronous stream errors).
+- Local recording at 15/24/30/60 fps: MKV/MP4 through `ffmpeg` when it is on
+  `PATH`; otherwise a unique numbered PNG sequence with FPS metadata that can
+  be muxed later.
 - Webcam device detection, with the UI stating clearly that frame capture is
   not implemented in this build.
 - Export the selected scene as SVG or PNG (dependency-free raster encoder).
@@ -33,10 +36,11 @@ desktop foundation.
 **Scope and honesty:** this is a local scene compositor, not an OBS clone and
 not a streaming/encoding pipeline. Screen capture is implemented for Linux/X11
 and was smoke-tested under Xvfb; it has not been exercised on a physical
-monitor or with Wayland. Microphone and webcam depend on host devices; in this
-environment no microphone or `/dev/video*` device was available, so those paths
-only report status and are not claimed as verified. Video recording requires
-`ffmpeg` at runtime; without it the recorder writes PNG frames.
+monitor or with Wayland. Microphone and webcam depend on host devices; device
+absence is reported honestly, but physical microphones and cameras are not
+claimed as verified. Video recording requires `ffmpeg` at runtime; without it
+the recorder writes PNG frames. Capture is a live preview source: recording
+saves the composed scene, not the desktop preview.
 
 ## Run
 
@@ -56,8 +60,8 @@ Without arguments the application opens an empty document.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
 Linux windowing development packages and ALSA headers (`libasound2-dev`) are
@@ -70,6 +74,23 @@ default because it needs a display):
 Xvfb :99 -screen 0 1280x720x24 -nolisten tcp &
 DISPLAY=:99 CARGO_TARGET_DIR=/tmp/cargo-target cargo test --workspace --locked -- --ignored
 ```
+
+The normal test suite also exercises the real ffmpeg pipe when `ffmpeg` is on
+`PATH`, including decoding the resulting video. CI installs ffmpeg and Xvfb and
+runs both paths explicitly.
+
+### PNG fallback recordings
+
+Without ffmpeg, a recording selected as `movie.mp4` is written to a new
+`movie.frames` directory (or `movie.frames-1`, etc., if it already exists).
+`recording.json` records the FPS, frame count and filename pattern. Mux it with:
+
+```bash
+ffmpeg -framerate 30 -i movie.frames/frame_%06d.png -c:v libx264 \
+  -pix_fmt yuv420p movie.mp4
+```
+
+Use the FPS from `recording.json` if it is not 30.
 
 ## Project layout
 

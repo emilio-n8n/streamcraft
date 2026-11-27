@@ -37,6 +37,8 @@ pub enum WebcamStatus {
     NoDevice,
     /// Cameras were found, but frame decoding is not available in this build.
     DevicesWithoutDecoder(Vec<WebcamDevice>),
+    /// The device directory could not be inspected reliably.
+    Unavailable(String),
 }
 
 impl WebcamStatus {
@@ -54,6 +56,7 @@ impl WebcamStatus {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Self::Unavailable(reason) => format!("Webcam detection unavailable: {reason}"),
         }
     }
 }
@@ -92,20 +95,43 @@ pub fn status_from_paths(paths: impl IntoIterator<Item = PathBuf>) -> WebcamStat
     }
 }
 
-/// Scan `/dev` for video device nodes. Missing or unreadable directories are
-/// reported as "no device" rather than producing an error.
+/// Scan `/dev` for video device nodes.
 #[must_use]
 pub fn probe_devices() -> WebcamStatus {
+    probe_directory(Path::new("/dev"))
+}
+
+/// Scan an injectable device directory. A missing directory means no device;
+/// permission and I/O failures are reported instead of being hidden as "none".
+#[must_use]
+pub fn probe_directory(directory: &Path) -> WebcamStatus {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return WebcamStatus::NoDevice;
+        }
+        Err(error) => {
+            return WebcamStatus::Unavailable(format!(
+                "could not read {}: {error}",
+                directory.display()
+            ));
+        }
+    };
     let mut paths = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(Path::new("/dev")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() || path.exists() {
-                paths.push(path);
-            }
+    let mut entry_error = None;
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(error) => entry_error = Some(error),
         }
     }
-    status_from_paths(paths)
+    let status = status_from_paths(paths);
+    match status {
+        WebcamStatus::NoDevice => entry_error.map_or(WebcamStatus::NoDevice, |error| {
+            WebcamStatus::Unavailable(format!("could not inspect every device: {error}"))
+        }),
+        status => status,
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +169,27 @@ mod tests {
         assert!(description.contains("no device"));
         let description = status_from_paths([PathBuf::from("/dev/video0")]).description();
         assert!(description.contains("not implemented"));
+    }
+
+    #[test]
+    fn probe_distinguishes_missing_and_unreadable_directories() {
+        let root = std::env::temp_dir().join(format!("streamcraft-webcam-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(probe_directory(&root), WebcamStatus::NoDevice);
+        std::fs::create_dir_all(&root).expect("directory");
+        std::fs::write(root.join("video2"), b"").expect("device fixture");
+        std::fs::write(root.join("video0"), b"").expect("device fixture");
+        assert_eq!(
+            probe_directory(&root),
+            status_from_paths([root.join("video0"), root.join("video2")])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::write(&root, b"not a directory").expect("file fixture");
+        assert!(matches!(
+            probe_directory(&root),
+            WebcamStatus::Unavailable(_)
+        ));
+        let _ = std::fs::remove_file(&root);
     }
 
     #[test]

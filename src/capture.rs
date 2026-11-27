@@ -8,6 +8,20 @@
 
 use std::fmt;
 
+/// Maximum RGBA capture buffer accepted from a display server (64 MiB).
+pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum width or height accepted for a capture target.
+pub const MAX_CAPTURE_DIMENSION: u32 = 16_384;
+
+fn frame_byte_count(width: u32, height: u32) -> Option<usize> {
+    let pixels = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?;
+    pixels
+        .checked_mul(4)
+        .filter(|bytes| *bytes <= MAX_FRAME_BYTES)
+}
+
 /// A captured frame in packed RGBA format, top-down rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureFrame {
@@ -22,8 +36,13 @@ pub struct CaptureFrame {
 impl CaptureFrame {
     /// Create a frame from raw RGBA data, rejecting a mismatched buffer size.
     pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Result<Self, CaptureError> {
-        let expected = width as usize * height as usize * 4;
-        if width == 0 || height == 0 || rgba.len() != expected {
+        let expected = frame_byte_count(width, height);
+        if width == 0
+            || height == 0
+            || width > MAX_CAPTURE_DIMENSION
+            || height > MAX_CAPTURE_DIMENSION
+            || expected != Some(rgba.len())
+        {
             return Err(CaptureError::InvalidFrame {
                 width,
                 height,
@@ -77,7 +96,7 @@ impl CaptureFrame {
 pub enum CaptureTarget {
     /// The whole virtual screen (root window).
     Screen,
-    /// A top-level X11 window.
+    /// An X11 window.
     Window {
         /// X11 window identifier.
         id: u32,
@@ -180,27 +199,199 @@ impl CaptureBackend for UnsupportedBackend {
 
 #[cfg(target_os = "linux")]
 mod x11 {
-    use super::{CaptureBackend, CaptureError, CaptureFrame, CaptureTarget};
+    use super::{
+        CaptureBackend, CaptureError, CaptureFrame, CaptureTarget, MAX_CAPTURE_DIMENSION,
+        MAX_FRAME_BYTES, frame_byte_count,
+    };
     use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{ConnectionExt, ImageFormat, Window};
+    use x11rb::protocol::xproto::{
+        ConnectionExt, ImageFormat, ImageOrder, MapState, VisualClass, Window,
+    };
     use x11rb::rust_connection::RustConnection;
 
-    fn window_title(connection: &RustConnection, window: Window) -> Option<String> {
-        let atom = connection
-            .intern_atom(false, b"WM_NAME")
-            .ok()?
-            .reply()
-            .ok()?
-            .atom;
+    const MAX_TARGET_WINDOWS: usize = 256;
+    const MAX_INSPECTED_WINDOWS: usize = 1024;
+    const MAX_WINDOW_DEPTH: usize = 8;
+
+    fn property_title(connection: &RustConnection, window: Window, name: &[u8]) -> Option<String> {
+        let atom = connection.intern_atom(false, name).ok()?.reply().ok()?.atom;
         let property = connection
             .get_property(false, window, atom, 0_u32, 0, 128)
             .ok()?
             .reply()
             .ok()?;
-        if property.value.is_empty() {
+        let bytes = property.value.strip_suffix(&[0]).unwrap_or(&property.value);
+        if bytes.is_empty() {
             return None;
         }
-        Some(String::from_utf8_lossy(&property.value).into_owned())
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    fn window_title(connection: &RustConnection, window: Window) -> Option<String> {
+        property_title(connection, window, b"_NET_WM_NAME")
+            .or_else(|| property_title(connection, window, b"WM_NAME"))
+    }
+
+    fn collect_window_targets(
+        connection: &RustConnection,
+        parent: Window,
+        depth: usize,
+        targets: &mut Vec<CaptureTarget>,
+        inspected: &mut usize,
+    ) {
+        if depth >= MAX_WINDOW_DEPTH
+            || targets.len() >= MAX_TARGET_WINDOWS
+            || *inspected >= MAX_INSPECTED_WINDOWS
+        {
+            return;
+        }
+        let Ok(cookie) = connection.query_tree(parent) else {
+            return;
+        };
+        let Ok(children) = cookie.reply() else {
+            return;
+        };
+        for window in children.children {
+            if targets.len() >= MAX_TARGET_WINDOWS || *inspected >= MAX_INSPECTED_WINDOWS {
+                break;
+            }
+            *inspected += 1;
+            let Ok(cookie) = connection.get_window_attributes(window) else {
+                continue;
+            };
+            let Ok(attributes) = cookie.reply() else {
+                continue;
+            };
+            if attributes.map_state != MapState::VIEWABLE {
+                continue;
+            }
+            if let Some(title) = window_title(connection, window)
+                && !title.trim().is_empty()
+            {
+                targets.push(CaptureTarget::Window { id: window, title });
+            }
+            // Dialogs and utility windows are often nested below the main
+            // top-level window. A bounded walk includes them without allowing
+            // a malformed tree to cause unbounded work.
+            collect_window_targets(connection, window, depth + 1, targets, inspected);
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct PixelFormat {
+        bytes_per_pixel: u8,
+        little_endian: bool,
+        masks: [u32; 3],
+    }
+
+    fn decode_pixels(
+        data: &[u8],
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        scanline_pad: u8,
+    ) -> Result<Vec<u8>, CaptureError> {
+        let byte_count = frame_byte_count(width, height)
+            .ok_or_else(|| CaptureError::Target("capture dimensions are too large".to_owned()))?;
+        let bits_per_pixel = u32::from(format.bytes_per_pixel) * 8;
+        let row_bits = width
+            .checked_mul(bits_per_pixel)
+            .ok_or_else(|| CaptureError::Target("capture row is too large".to_owned()))?;
+        let pad = u32::from(scanline_pad);
+        let padded_bits = row_bits
+            .checked_add(pad.saturating_sub(1))
+            .and_then(|bits| bits.checked_div(pad))
+            .and_then(|rows| rows.checked_mul(pad))
+            .ok_or_else(|| CaptureError::Target("invalid scanline padding".to_owned()))?;
+        let stride = usize::try_from(padded_bits / 8)
+            .map_err(|_| CaptureError::Target("capture stride is too large".to_owned()))?;
+        let expected = stride
+            .checked_mul(usize::try_from(height).unwrap_or(usize::MAX))
+            .filter(|bytes| {
+                *bytes <= MAX_FRAME_BYTES + usize::try_from(MAX_CAPTURE_DIMENSION).unwrap_or(0) * 4
+            })
+            .ok_or_else(|| CaptureError::Target("capture data is too large".to_owned()))?;
+        if data.len() < expected {
+            return Err(CaptureError::Target(format!(
+                "truncated image data: expected {expected} bytes, got {}",
+                data.len()
+            )));
+        }
+
+        let channels = [
+            ColorChannel::new(format.masks[0])?,
+            ColorChannel::new(format.masks[1])?,
+            ColorChannel::new(format.masks[2])?,
+        ];
+        let mut rgba = vec![0_u8; byte_count];
+        let pixel_bytes = usize::from(format.bytes_per_pixel);
+        for y in 0..usize::try_from(height).unwrap_or(usize::MAX) {
+            for x in 0..usize::try_from(width).unwrap_or(usize::MAX) {
+                let source = y * stride + x * pixel_bytes;
+                let mut raw = 0_u32;
+                for (offset, &byte) in data[source..source + pixel_bytes].iter().enumerate() {
+                    if format.little_endian {
+                        raw |= u32::from(byte) << (offset * 8);
+                    } else {
+                        raw = (raw << 8) | u32::from(byte);
+                    }
+                }
+                let destination = (y * usize::try_from(width).unwrap_or(usize::MAX) + x) * 4;
+                for (channel, layout) in channels.into_iter().enumerate() {
+                    rgba[destination + channel] = layout.decode(raw);
+                }
+                rgba[destination + 3] = 255;
+            }
+        }
+        Ok(rgba)
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ColorChannel {
+        mask: u32,
+        shift: u32,
+        maximum: u32,
+    }
+
+    impl ColorChannel {
+        fn new(mask: u32) -> Result<Self, CaptureError> {
+            if mask == 0 {
+                return Ok(Self {
+                    mask,
+                    shift: 0,
+                    maximum: 0,
+                });
+            }
+            let shift = mask.trailing_zeros();
+            let maximum = mask >> shift;
+            if maximum
+                .checked_add(1)
+                .is_some_and(|next| next & (next - 1) != 0)
+            {
+                return Err(CaptureError::Target(format!(
+                    "unsupported non-contiguous colour mask {mask:#x}"
+                )));
+            }
+            Ok(Self {
+                mask,
+                shift,
+                maximum,
+            })
+        }
+
+        fn decode(self, raw: u32) -> u8 {
+            if self.mask == 0 {
+                return 0;
+            }
+            let value = u64::from((raw & self.mask) >> self.shift);
+            let maximum = u64::from(self.maximum);
+            ((value * 255 + maximum / 2) / maximum) as u8
+        }
+    }
+
+    #[cfg(test)]
+    fn decode_channel(raw: u32, mask: u32) -> Result<u8, CaptureError> {
+        ColorChannel::new(mask).map(|channel| channel.decode(raw))
     }
 
     /// Linux/X11 capture backend using core `GetImage`.
@@ -212,6 +403,8 @@ mod x11 {
         }
 
         fn connect(&self) -> Result<(RustConnection, usize), CaptureError> {
+            // A fresh connection on every attempt reconnects automatically if
+            // the X server restarts; no stale socket is cached in the backend.
             let (connection, screen_number) =
                 x11rb::connect(None).map_err(|error| CaptureError::NoDisplay(error.to_string()))?;
             if screen_number >= connection.setup().roots.len() {
@@ -236,18 +429,8 @@ mod x11 {
             let (connection, screen_number) = self.connect()?;
             let root = connection.setup().roots[screen_number].root;
             let mut targets = vec![CaptureTarget::Screen];
-            let children = connection
-                .query_tree(root)
-                .map_err(|error| CaptureError::Display(error.to_string()))?
-                .reply()
-                .map_err(|error| CaptureError::Display(error.to_string()))?;
-            for window in children.children {
-                if let Some(title) = window_title(&connection, window)
-                    && !title.is_empty()
-                {
-                    targets.push(CaptureTarget::Window { id: window, title });
-                }
-            }
+            let mut inspected = 0;
+            collect_window_targets(&connection, root, 0, &mut targets, &mut inspected);
             Ok(targets)
         }
 
@@ -258,6 +441,13 @@ mod x11 {
                 CaptureTarget::Screen => screen.root,
                 CaptureTarget::Window { id, .. } => *id,
             };
+            if let CaptureTarget::Window { id, title } = target
+                && window_title(&connection, *id).as_deref() != Some(title.as_str())
+            {
+                return Err(CaptureError::Target(
+                    "window is gone or its title changed; refresh targets".to_owned(),
+                ));
+            }
             let geometry = connection
                 .get_geometry(drawable)
                 .map_err(|error| CaptureError::Display(error.to_string()))?
@@ -265,6 +455,16 @@ mod x11 {
                 .map_err(|error| CaptureError::Display(error.to_string()))?;
             if geometry.width == 0 || geometry.height == 0 {
                 return Err(CaptureError::Target("target has zero size".to_owned()));
+            }
+            let width = u32::from(geometry.width);
+            let height = u32::from(geometry.height);
+            if width > MAX_CAPTURE_DIMENSION
+                || height > MAX_CAPTURE_DIMENSION
+                || frame_byte_count(width, height).is_none()
+            {
+                return Err(CaptureError::Target(format!(
+                    "target {width}x{height} exceeds the 64 MiB capture limit"
+                )));
             }
 
             let reply = connection
@@ -281,62 +481,139 @@ mod x11 {
                 .reply()
                 .map_err(|error| CaptureError::Display(error.to_string()))?;
 
-            let width = geometry.width;
-            let height = geometry.height;
-            let bpp = reply.depth;
-            if bpp != 24 && bpp != 32 {
-                return Err(CaptureError::Target(format!(
-                    "unsupported screen depth {bpp} (expected 24 or 32)"
-                )));
-            }
-            let stride = reply
-                .data
-                .len()
-                .checked_div(height as usize)
-                .ok_or_else(|| CaptureError::Target("empty image data".to_owned()))?;
-            let pixel_stride = stride.checked_div(width as usize).unwrap_or(4);
-            if pixel_stride < 3 {
-                return Err(CaptureError::Target(format!(
-                    "unsupported pixel stride {pixel_stride}"
-                )));
-            }
-
             let visual = screen
                 .allowed_depths
                 .iter()
                 .flat_map(|depth| &depth.visuals)
-                .find(|visual| visual.visual_id == screen.root_visual)
-                .or_else(|| {
-                    screen
-                        .allowed_depths
-                        .first()
-                        .and_then(|depth| depth.visuals.first())
-                });
-            let (red_mask, blue_mask) = visual
-                .map(|visual| (visual.red_mask, visual.blue_mask))
-                .unwrap_or((0x00ff_0000, 0x0000_00ff));
-            let bgr = red_mask == 0x00ff_0000 && blue_mask == 0x0000_00ff;
-
-            let mut rgba = vec![0_u8; width as usize * height as usize * 4];
-            for y in 0..height as usize {
-                for x in 0..width as usize {
-                    let source = y * stride + x * pixel_stride;
-                    if source + 2 >= reply.data.len() {
-                        return Err(CaptureError::Target("truncated image data".to_owned()));
-                    }
-                    let (red, blue) = if bgr {
-                        (reply.data[source + 2], reply.data[source])
-                    } else {
-                        (reply.data[source], reply.data[source + 2])
-                    };
-                    let destination = (y * width as usize + x) * 4;
-                    rgba[destination] = red;
-                    rgba[destination + 1] = reply.data[source + 1];
-                    rgba[destination + 2] = blue;
-                    rgba[destination + 3] = 255;
-                }
+                .find(|visual| visual.visual_id == reply.visual)
+                .ok_or_else(|| {
+                    CaptureError::Target(format!("unknown X11 visual {}", reply.visual))
+                })?;
+            if visual.class != VisualClass::TRUE_COLOR && visual.class != VisualClass::DIRECT_COLOR
+            {
+                return Err(CaptureError::Target(format!(
+                    "unsupported X11 visual class {:?}",
+                    visual.class
+                )));
             }
-            CaptureFrame::new(u32::from(width), u32::from(height), rgba)
+            let format = connection
+                .setup()
+                .pixmap_formats
+                .iter()
+                .filter(|format| format.depth == reply.depth)
+                .max_by_key(|format| format.bits_per_pixel)
+                .filter(|format| matches!(format.bits_per_pixel, 16 | 24 | 32))
+                .ok_or_else(|| {
+                    CaptureError::Target(format!(
+                        "unsupported X11 depth {} (expected 16, 24 or 32 bits)",
+                        reply.depth
+                    ))
+                })?;
+            let little_endian = match connection.setup().image_byte_order {
+                ImageOrder::LSB_FIRST => true,
+                ImageOrder::MSB_FIRST => false,
+                order => {
+                    return Err(CaptureError::Target(format!(
+                        "unsupported X11 image byte order {order:?}"
+                    )));
+                }
+            };
+            let rgba = decode_pixels(
+                &reply.data,
+                width,
+                height,
+                PixelFormat {
+                    bytes_per_pixel: format.bits_per_pixel / 8,
+                    little_endian,
+                    masks: [visual.red_mask, visual.green_mask, visual.blue_mask],
+                },
+                format.scanline_pad,
+            )?;
+            CaptureFrame::new(width, height, rgba)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn format(bytes_per_pixel: u8, little_endian: bool, masks: [u32; 3]) -> PixelFormat {
+            PixelFormat {
+                bytes_per_pixel,
+                little_endian,
+                masks,
+            }
+        }
+
+        #[test]
+        fn decodes_bgrx_and_rgba_without_using_depth_as_stride() {
+            let bgrx = [0, 0, 255, 0, 255, 0, 0, 0];
+            assert_eq!(
+                decode_pixels(
+                    &bgrx,
+                    2,
+                    1,
+                    format(4, true, [0x00ff_0000, 0x0000_ff00, 0x0000_00ff]),
+                    32,
+                )
+                .expect("BGRX"),
+                [255, 0, 0, 255, 0, 0, 255, 255]
+            );
+            assert_eq!(
+                decode_pixels(
+                    &[0, 0, 255, 255],
+                    1,
+                    1,
+                    format(4, true, [0x0000_00ff, 0x0000_ff00, 0x00ff_0000]),
+                    32,
+                )
+                .expect("RGBA"),
+                [0, 0, 255, 255]
+            );
+        }
+
+        #[test]
+        fn decodes_rgb565_and_big_endian_pixels() {
+            assert_eq!(
+                decode_pixels(
+                    &[0, 0xf8, 0x1f, 0],
+                    2,
+                    1,
+                    format(2, true, [0xf800, 0x07e0, 0x001f]),
+                    16,
+                )
+                .expect("RGB565"),
+                [255, 0, 0, 255, 0, 0, 255, 255]
+            );
+            assert_eq!(
+                decode_pixels(
+                    &[0, 255, 0, 0],
+                    1,
+                    1,
+                    format(4, false, [0x00ff_0000, 0x0000_ff00, 0x0000_00ff]),
+                    32,
+                )
+                .expect("big endian"),
+                [255, 0, 0, 255]
+            );
+        }
+
+        #[test]
+        fn rejects_truncated_data_and_invalid_masks() {
+            assert!(matches!(
+                decode_pixels(
+                    &[0, 0, 0],
+                    1,
+                    1,
+                    format(4, true, [0x00ff_0000, 0x0000_ff00, 0x0000_00ff]),
+                    32,
+                ),
+                Err(CaptureError::Target(_))
+            ));
+            assert!(matches!(
+                decode_channel(0, 0b0101),
+                Err(CaptureError::Target(_))
+            ));
         }
     }
 }
@@ -354,6 +631,14 @@ mod tests {
         ));
         assert!(matches!(
             CaptureFrame::new(0, 10, Vec::new()),
+            Err(CaptureError::InvalidFrame { .. })
+        ));
+        assert!(matches!(
+            CaptureFrame::new(u32::MAX, u32::MAX, Vec::new()),
+            Err(CaptureError::InvalidFrame { .. })
+        ));
+        assert!(matches!(
+            CaptureFrame::new(MAX_CAPTURE_DIMENSION + 1, 1, vec![0; 4]),
             Err(CaptureError::InvalidFrame { .. })
         ));
     }
@@ -377,6 +662,80 @@ mod tests {
         let _ = backend.available();
         let _ = backend.targets();
         let _ = backend.capture(&CaptureTarget::Screen);
+    }
+
+    #[test]
+    #[ignore = "requires a real X display; run with `xvfb-run -a cargo test -- --ignored`"]
+    fn x11_lists_and_captures_a_window_after_reconnecting() {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::{ConnectionExt, CreateWindowAux, PropMode, WindowClass};
+        use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
+
+        let (connection, screen_number) = x11rb::connect(None).expect("connect");
+        let screen = &connection.setup().roots[screen_number];
+        let window = connection.generate_id().expect("window id");
+        connection
+            .create_window(
+                0,
+                window,
+                screen.root,
+                10,
+                10,
+                80,
+                50,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                screen.root_visual,
+                &CreateWindowAux::new(),
+            )
+            .expect("create window");
+        let utf8 = connection
+            .intern_atom(false, b"UTF8_STRING")
+            .expect("intern UTF8")
+            .reply()
+            .expect("UTF8 atom")
+            .atom;
+        connection
+            .change_property8(
+                PropMode::REPLACE,
+                window,
+                connection
+                    .intern_atom(false, b"_NET_WM_NAME")
+                    .expect("intern title")
+                    .reply()
+                    .expect("title atom")
+                    .atom,
+                utf8,
+                b"StreamCraft capture test",
+            )
+            .expect("set title");
+        connection.map_window(window).expect("map window");
+        connection.sync().expect("sync");
+
+        let backend = default_backend();
+        let targets = backend.targets().expect("targets");
+        assert!(targets.iter().any(|target| matches!(
+            target,
+            CaptureTarget::Window { title, .. } if title == "StreamCraft capture test"
+        )));
+        for _ in 0..2 {
+            let frame = backend
+                .capture(&CaptureTarget::Window {
+                    id: window,
+                    title: "StreamCraft capture test".to_owned(),
+                })
+                .expect("capture window");
+            assert_eq!((frame.width, frame.height), (80, 50));
+        }
+        connection.destroy_window(window).expect("destroy window");
+        connection.sync().expect("sync destruction");
+        assert!(matches!(
+            backend.capture(&CaptureTarget::Window {
+                id: window,
+                title: "StreamCraft capture test".to_owned(),
+            }),
+            Err(CaptureError::Target(_))
+        ));
     }
 
     #[test]

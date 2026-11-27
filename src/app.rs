@@ -16,14 +16,14 @@ use craftkit_ui::egui::{
 };
 use craftkit_ui::{AppIdentity, AppShell, Tone, dialogs, theme, widgets};
 
-use crate::audio::AudioMonitor;
+use crate::audio::{AudioMonitor, AudioStatus};
 use crate::capture::{CaptureBackend, CaptureTarget, default_backend};
 use crate::document::{
-    CANVAS_H, CANVAS_W, Color, Document, FORMAT, SCHEMA_VERSION, SMPTE_BARS, SMPTE_LOWER,
+    CANVAS_H, CANVAS_W, Color, Document, FORMAT, SCHEMA_VERSION, SMPTE_BARS, SMPTE_LOWER, Scene,
     SourceKind, Transition, TransitionKind,
 };
-use crate::recording::{Container, RecordingSession, choose_plan, find_program};
-use crate::render::render_scene_png;
+use crate::recording::{Container, FramePacer, RecordingSession, choose_plan, find_program};
+use crate::render::{render_scene_png, render_transition_png};
 use crate::webcam::probe_devices;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -82,6 +82,7 @@ pub struct StreamCraftApp {
     selected_source: Option<u64>,
     drag: Option<DragState>,
     property_gesture: bool,
+    transition_gesture: bool,
     pending: Option<PendingAction>,
     capture_backend: Box<dyn CaptureBackend>,
     capture_target: CaptureTarget,
@@ -93,9 +94,11 @@ pub struct StreamCraftApp {
     recording: Option<RecordingSession>,
     record_container: Container,
     record_fps: u32,
-    record_last_frame: Instant,
+    record_started: Instant,
+    record_pacer: Option<FramePacer>,
     fullscreen: bool,
     transition_start: Option<Instant>,
+    transition_from: Option<Scene>,
     transition: Transition,
 }
 
@@ -126,6 +129,7 @@ impl StreamCraftApp {
             selected_source: None,
             drag: None,
             property_gesture: false,
+            transition_gesture: false,
             pending: None,
             capture_backend,
             capture_target: CaptureTarget::Screen,
@@ -141,9 +145,11 @@ impl StreamCraftApp {
             recording: None,
             record_container: Container::Mkv,
             record_fps: 30,
-            record_last_frame: Instant::now(),
+            record_started: Instant::now(),
+            record_pacer: None,
             fullscreen: false,
             transition_start: None,
+            transition_from: None,
             transition,
         };
         app.shell.install_theme(&context.egui_ctx);
@@ -158,6 +164,7 @@ impl StreamCraftApp {
             Ok(host) => {
                 self.host = host;
                 self.selected_source = None;
+                self.clear_transition();
                 self.transition = self
                     .host
                     .document()
@@ -175,8 +182,14 @@ impl StreamCraftApp {
     fn new_document(&mut self) {
         self.host.reset(Document::default());
         self.selected_source = None;
+        self.clear_transition();
         self.transition = Transition::default();
         self.shell.set_status("New document");
+    }
+
+    fn clear_transition(&mut self) {
+        self.transition_start = None;
+        self.transition_from = None;
     }
 
     fn finish_property_gesture(&mut self) {
@@ -186,17 +199,34 @@ impl StreamCraftApp {
         }
     }
 
+    fn finish_transition_gesture(&mut self) {
+        if self.transition_gesture {
+            self.host.history_mut().end_gesture();
+            self.transition_gesture = false;
+        }
+    }
+
     fn finish_gesture(&mut self) {
         if self.drag.take().is_some() {
             self.host.history_mut().end_gesture();
         }
         self.finish_property_gesture();
+        self.finish_transition_gesture();
     }
 
     fn begin_property_gesture(&mut self) {
+        self.finish_transition_gesture();
         if !self.property_gesture {
             self.host.history_mut().begin_gesture();
             self.property_gesture = true;
+        }
+    }
+
+    fn begin_transition_gesture(&mut self) {
+        self.finish_property_gesture();
+        if !self.transition_gesture {
+            self.host.history_mut().begin_gesture();
+            self.transition_gesture = true;
         }
     }
 
@@ -217,11 +247,15 @@ impl StreamCraftApp {
     }
 
     fn edit_transition(&mut self, index: usize, transition: Transition) {
+        self.finish_gesture();
         self.host.apply(|document| {
             if let Some(scene) = document.scenes.get_mut(index) {
                 scene.transition = transition;
             }
         });
+        if index == self.host.document().selected_scene {
+            self.transition = transition;
+        }
     }
 
     fn edit_text(&mut self, id: u64, text: String) {
@@ -390,64 +424,81 @@ impl StreamCraftApp {
 
     fn switch_scene(&mut self, next: bool) {
         self.finish_gesture();
-        let changed = self.host.apply(|document| {
+        let document = self.host.document();
+        let count = document.scenes.len();
+        if count < 2 {
+            return;
+        }
+        let current = document.selected_scene;
+        let target = if next {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
+        if target == current {
+            return;
+        }
+        let from = document.selected_scene().cloned();
+        let transition = document.scenes[target].transition;
+        if self.host.apply(|document| {
             if next {
                 document.next_scene();
             } else {
                 document.previous_scene();
             }
-        });
-        if changed {
+        }) {
             self.selected_source = None;
-            self.transition = self
-                .host
-                .document()
-                .selected_scene()
-                .map_or(Transition::default(), |scene| scene.transition);
+            self.transition = transition;
+            self.transition_from = from;
             self.transition_start = Some(Instant::now());
             self.shell.set_status(format!(
                 "Scene {} - {} transition",
-                self.host.document().selected_scene + 1,
+                target + 1,
                 self.transition.kind.label()
             ));
         }
     }
 
     fn select_scene(&mut self, index: usize) {
-        if index == self.host.document().selected_scene {
+        self.finish_gesture();
+        let document = self.host.document();
+        if index == document.selected_scene || index >= document.scenes.len() {
             return;
         }
-        let transition = self
-            .host
-            .document()
-            .scenes
-            .get(index)
-            .map_or(Transition::default(), |scene| scene.transition);
+        let from = document.selected_scene().cloned();
+        let transition = document.scenes[index].transition;
         if self.host.apply(|document| {
             document.select_scene(index);
         }) {
             self.selected_source = None;
             self.transition = transition;
+            self.transition_from = from;
             self.transition_start = Some(Instant::now());
         }
+    }
+
+    fn refresh_capture_targets(&mut self) {
+        match self.capture_backend.targets() {
+            Ok(targets) => {
+                self.capture_targets = targets;
+                if !self.capture_targets.contains(&self.capture_target) {
+                    self.capture_target = self
+                        .capture_targets
+                        .first()
+                        .cloned()
+                        .unwrap_or(CaptureTarget::Screen);
+                }
+                self.capture_preview.error = None;
+            }
+            Err(error) => self.capture_preview.error = Some(error.to_string()),
+        }
+        self.capture_preview.texture = None;
     }
 
     fn toggle_capture(&mut self) {
         self.capture_enabled = !self.capture_enabled;
         if self.capture_enabled {
-            match self.capture_backend.targets() {
-                Ok(targets) => {
-                    self.capture_targets = targets;
-                    if !self.capture_targets.contains(&self.capture_target) {
-                        self.capture_target = self
-                            .capture_targets
-                            .first()
-                            .cloned()
-                            .unwrap_or(CaptureTarget::Screen);
-                    }
-                }
-                Err(error) => self.capture_preview.error = Some(error.to_string()),
-            }
+            self.refresh_capture_targets();
             self.capture_preview.last_attempt = Instant::now() - CAPTURE_INTERVAL;
             let available = self.capture_backend.available();
             self.shell.set_status(format!(
@@ -457,6 +508,7 @@ impl StreamCraftApp {
             ));
         } else {
             self.capture_preview.texture = None;
+            self.capture_preview.error = None;
             self.shell.set_status("Capture preview stopped");
         }
     }
@@ -481,7 +533,12 @@ impl StreamCraftApp {
                 }
                 self.capture_preview.error = None;
             }
-            Err(error) => self.capture_preview.error = Some(error.to_string()),
+            Err(error) => {
+                // Never leave a stale frame on screen after a target or display
+                // server disappears.
+                self.capture_preview.texture = None;
+                self.capture_preview.error = Some(error.to_string());
+            }
         }
     }
 
@@ -495,6 +552,14 @@ impl StreamCraftApp {
             );
             return;
         }
+        let Ok(pacer) = FramePacer::new(self.record_fps) else {
+            self.shell.notify(
+                Tone::Error,
+                "Could not start recording",
+                "Choose a frame rate between 1 and 120 fps.",
+            );
+            return;
+        };
         let extension = self.record_container.extension();
         let default_name = format!("recording.{extension}");
         let Some(output) = dialogs::save_project("Start recording", &default_name, extension)
@@ -502,14 +567,15 @@ impl StreamCraftApp {
             return;
         };
         let path_var = std::env::var_os("PATH").unwrap_or_default();
-        let program = find_program(&path_var.to_string_lossy(), "ffmpeg");
+        let program = find_program(&path_var, "ffmpeg");
         let plan = choose_plan(program, output, self.record_container, self.record_fps);
         match RecordingSession::start(plan, self.record_fps) {
             Ok(session) => {
                 self.shell
                     .set_status(format!("Recording: {}", session.plan().description()));
                 self.recording = Some(session);
-                self.record_last_frame = Instant::now();
+                self.record_started = Instant::now();
+                self.record_pacer = Some(pacer);
             }
             Err(error) => self
                 .shell
@@ -521,6 +587,7 @@ impl StreamCraftApp {
         let Some(session) = self.recording.take() else {
             return;
         };
+        self.record_pacer = None;
         match session.finish() {
             Ok(frames) => {
                 self.shell
@@ -536,28 +603,36 @@ impl StreamCraftApp {
     }
 
     fn poll_recording(&mut self) {
-        let interval = Duration::from_millis(u64::from(1000 / self.record_fps.max(1)));
-        let elapsed = self.record_last_frame.elapsed();
-        if elapsed < interval {
+        let Some(pacer) = self.record_pacer else {
             return;
-        }
-        // Rendering can be slower than the target frame rate. Repeat the frame
-        // for every missed interval so the video keeps wall-clock duration.
-        let due = (elapsed.as_secs_f64() / interval.as_secs_f64())
-            .floor()
-            .clamp(1.0, 30.0) as u32;
-        self.record_last_frame += interval * due;
+        };
         let Some(session) = self.recording.as_mut() else {
             return;
         };
+        let due = pacer.frames_due(self.record_started.elapsed(), session.frames());
+        if due == 0 {
+            return;
+        }
         let Some(scene) = self.host.document().selected_scene().cloned() else {
             return;
         };
-        let png = render_scene_png(&scene);
+        let png = self.transition_from.as_ref().map_or_else(
+            || render_scene_png(&scene),
+            |from| {
+                let progress = self.transition_start.map_or(1.0, |start| {
+                    self.transition
+                        .progress(u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX))
+                });
+                render_transition_png(from, &scene, progress)
+            },
+        );
         for _ in 0..due {
             if let Err(error) = session.push_frame(&png) {
                 self.shell.notify(Tone::Error, "Recording stopped", error);
+                // Dropping the session terminates and reaps ffmpeg, or leaves
+                // the already-written PNG frames available for manual muxing.
                 self.recording = None;
+                self.record_pacer = None;
                 break;
             }
         }
@@ -578,6 +653,7 @@ impl StreamCraftApp {
             Action::Undo => {
                 self.finish_gesture();
                 if self.host.undo() {
+                    self.clear_transition();
                     self.clamp_selection();
                     self.shell.set_status("Undo");
                 }
@@ -585,6 +661,7 @@ impl StreamCraftApp {
             Action::Redo => {
                 self.finish_gesture();
                 if self.host.redo() {
+                    self.clear_transition();
                     self.clamp_selection();
                     self.shell.set_status("Redo");
                 }
@@ -775,6 +852,7 @@ impl StreamCraftApp {
             .map(|(index, scene)| (index, scene.name.clone(), scene.transition))
             .collect();
         let selected_scene = self.host.document().selected_scene;
+        let mut end_transition_gesture = false;
 
         egui::Panel::left("streamcraft-scenes")
             .resizable(true)
@@ -799,18 +877,40 @@ impl StreamCraftApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Add scene").clicked() {
+                        self.finish_gesture();
+                        let from = self.host.document().selected_scene().cloned();
                         self.host.apply(|document| {
                             document.add_scene();
                         });
                         self.selected_source = None;
+                        self.transition = self
+                            .host
+                            .document()
+                            .selected_scene()
+                            .map_or(Transition::default(), |scene| scene.transition);
+                        self.transition_from = from;
+                        self.transition_start = Some(Instant::now());
                         self.shell.set_status("Scene added");
                     }
                     if ui.button("Remove").clicked() {
+                        self.finish_gesture();
                         let index = self.host.document().selected_scene;
+                        let from = self.host.document().selected_scene().cloned();
                         self.host.apply(|document| {
                             document.remove_scene(index);
                         });
                         self.clamp_selection();
+                        self.transition = self
+                            .host
+                            .document()
+                            .selected_scene()
+                            .map_or(Transition::default(), |scene| scene.transition);
+                        if self.host.document().selected_scene != index {
+                            self.transition_from = from;
+                            self.transition_start = Some(Instant::now());
+                        } else {
+                            self.clear_transition();
+                        }
                     }
                 });
                 ui.separator();
@@ -827,21 +927,40 @@ impl StreamCraftApp {
                         ui.selectable_value(&mut kind, TransitionKind::Cut, "Cut");
                         ui.selectable_value(&mut kind, TransitionKind::Fade, "Fade");
                     });
+                if kind != current.kind {
+                    self.edit_transition(
+                        selected_scene,
+                        Transition {
+                            kind,
+                            duration_ms: current.duration_ms,
+                        },
+                    );
+                }
                 let mut duration = current.duration_ms;
-                ui.add(
+                let response = ui.add(
                     egui::DragValue::new(&mut duration)
                         .prefix("ms ")
                         .speed(10.0)
                         .range(0..=10_000),
                 );
-                let updated = Transition {
-                    kind,
-                    duration_ms: duration,
-                };
-                if updated != current {
-                    self.edit_transition(selected_scene, updated);
+                if response.changed() {
+                    self.begin_transition_gesture();
+                    if let Some(scene) = self
+                        .host
+                        .history_mut()
+                        .current_mut()
+                        .scenes
+                        .get_mut(selected_scene)
+                    {
+                        scene.transition.duration_ms = duration;
+                    }
+                    self.transition.duration_ms = duration;
                 }
+                end_transition_gesture |= response.drag_stopped() || response.lost_focus();
             });
+        if end_transition_gesture {
+            self.finish_transition_gesture();
+        }
     }
 
     fn sources_panel(&mut self, ui: &mut egui::Ui) {
@@ -880,17 +999,20 @@ impl StreamCraftApp {
                                 }
                                 let id = *id;
                                 if ui.small_button("^").on_hover_text("Raise").clicked() {
+                                    self.finish_gesture();
                                     self.host.apply(|document| {
                                         document.move_source_z(id, 1);
                                     });
                                 }
                                 if ui.small_button("v").on_hover_text("Lower").clicked() {
+                                    self.finish_gesture();
                                     self.host.apply(|document| {
                                         document.move_source_z(id, -1);
                                     });
                                 }
                                 let mut visible = *visible;
                                 if ui.checkbox(&mut visible, "").changed() {
+                                    self.finish_gesture();
                                     self.host.apply(|document| {
                                         if let Some(source) = document
                                             .selected_scene_mut()
@@ -915,10 +1037,17 @@ impl StreamCraftApp {
                         self.add_source(SourceKind::Text);
                     }
                 });
+                ui.separator();
+                widgets::section_label(ui, "Devices");
+                if ui.button("Rescan webcams").clicked() {
+                    self.webcam = probe_devices();
+                    self.shell.set_status("Webcam devices rescanned");
+                }
             });
     }
 
     fn add_source(&mut self, kind: SourceKind) {
+        self.finish_gesture();
         let mut created = None;
         self.host.apply(|document| {
             created = document.add_source(kind);
@@ -1026,6 +1155,7 @@ impl StreamCraftApp {
 
                 let mut color = to_color32(source.color, 1.0);
                 if ui.color_edit_button_srgba(&mut color).changed() {
+                    self.finish_property_gesture();
                     let rgb = Color {
                         r: color.r(),
                         g: color.g(),
@@ -1044,6 +1174,7 @@ impl StreamCraftApp {
 
                 let mut visible = source.visible;
                 if ui.checkbox(&mut visible, "Visible").changed() {
+                    self.finish_property_gesture();
                     self.host.apply(|document| {
                         if let Some(source) = document
                             .selected_scene_mut()
@@ -1057,17 +1188,20 @@ impl StreamCraftApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.small_button("Raise").clicked() {
+                        self.finish_property_gesture();
                         self.host.apply(|document| {
                             document.move_source_z(id, 1);
                         });
                     }
                     if ui.small_button("Lower").clicked() {
+                        self.finish_property_gesture();
                         self.host.apply(|document| {
                             document.move_source_z(id, -1);
                         });
                     }
                 });
                 if ui.button("Delete source").clicked() {
+                    self.finish_property_gesture();
                     self.host.apply(|document| {
                         document.remove_source(id);
                     });
@@ -1089,6 +1223,7 @@ impl StreamCraftApp {
     fn central_panel(&mut self, ui: &mut egui::Ui) {
         let mut action = None;
         let mut container = self.record_container;
+        let mut fps = self.record_fps;
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Composition");
@@ -1116,12 +1251,25 @@ impl StreamCraftApp {
                         .size(11.0)
                         .color(theme::MUTED),
                 );
-                egui::ComboBox::from_id_salt("record-container")
-                    .selected_text(container.extension())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut container, Container::Mkv, "mkv");
-                        ui.selectable_value(&mut container, Container::Mp4, "mp4");
-                    });
+                ui.add_enabled_ui(self.recording.is_none(), |ui| {
+                    egui::ComboBox::from_id_salt("record-container")
+                        .selected_text(container.extension())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut container, Container::Mkv, "mkv");
+                            ui.selectable_value(&mut container, Container::Mp4, "mp4");
+                        });
+                });
+                ui.label("Frame rate");
+                ui.add_enabled_ui(self.recording.is_none(), |ui| {
+                    egui::ComboBox::from_id_salt("record-fps")
+                        .selected_text(format!("{fps} fps"))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut fps, 15, "15 fps");
+                            ui.selectable_value(&mut fps, 24, "24 fps");
+                            ui.selectable_value(&mut fps, 30, "30 fps");
+                            ui.selectable_value(&mut fps, 60, "60 fps");
+                        });
+                });
                 if self.recording.is_some() {
                     if widgets::toolbar_button(ui, "Stop", "Stop recording").clicked() {
                         action = Some(Action::StopRecording);
@@ -1133,8 +1281,11 @@ impl StreamCraftApp {
             ui.add_space(6.0);
             self.paint_canvas(ui);
         });
-        if container != self.record_container {
+        if container != self.record_container && self.recording.is_none() {
             self.record_container = container;
+        }
+        if fps != self.record_fps && self.recording.is_none() {
+            self.record_fps = fps;
         }
         if let Some(action) = action {
             self.handle_action(action);
@@ -1165,13 +1316,18 @@ impl StreamCraftApp {
         };
 
         let scene = self.host.document().selected_scene().cloned();
-        if let Some(scene) = &scene {
+        let selected_source = self.selected_source;
+        let paint_scene = |scene: &Scene, scene_opacity: f32, show_selection: bool| {
+            if scene_opacity <= 0.0 {
+                return;
+            }
             for source in &scene.sources {
-                if !source.visible || source.opacity <= 0.0 {
+                let opacity = source.opacity * scene_opacity;
+                if !source.visible || opacity <= 0.0 {
                     continue;
                 }
                 let source_rect = to_rect(source.x, source.y, source.w, source.h);
-                let color = to_color32(source.color, source.opacity);
+                let color = to_color32(source.color, opacity);
                 match source.kind {
                     SourceKind::Color => {
                         painter.rect_filled(source_rect, 0.0, color);
@@ -1184,7 +1340,7 @@ impl StreamCraftApp {
                                 source_rect.min + Vec2::new(index as f32 * bar_w, 0.0),
                                 Vec2::new(bar_w + 0.5, top_h),
                             );
-                            painter.rect_filled(bar_rect, 0.0, to_color32(*bar, source.opacity));
+                            painter.rect_filled(bar_rect, 0.0, to_color32(*bar, opacity));
                         }
                         let bottom_h = source_rect.height() - top_h;
                         let bottom_w = source_rect.width() / SMPTE_LOWER.len() as f32;
@@ -1193,7 +1349,7 @@ impl StreamCraftApp {
                                 source_rect.min + Vec2::new(index as f32 * bottom_w, top_h),
                                 Vec2::new(bottom_w + 0.5, bottom_h),
                             );
-                            painter.rect_filled(bar_rect, 0.0, to_color32(*bar, source.opacity));
+                            painter.rect_filled(bar_rect, 0.0, to_color32(*bar, opacity));
                         }
                     }
                     SourceKind::Text => {
@@ -1207,7 +1363,7 @@ impl StreamCraftApp {
                         );
                     }
                 }
-                if self.selected_source == Some(source.id) {
+                if show_selection && selected_source == Some(source.id) {
                     painter.rect_stroke(
                         source_rect,
                         0.0,
@@ -1216,20 +1372,24 @@ impl StreamCraftApp {
                     );
                 }
             }
-        }
+        };
 
+        let mut transition_complete = false;
         if let Some(start) = self.transition_start {
             let elapsed = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
-            let alpha = 1.0 - self.transition.progress(elapsed);
-            if alpha > 0.0 {
-                painter.rect_filled(
-                    rect,
-                    0.0,
-                    Color32::from_rgba_unmultiplied(0, 0, 0, (alpha * 255.0) as u8),
-                );
-            } else {
-                self.transition_start = None;
+            let progress = self.transition.progress(elapsed);
+            if let Some(from) = self.transition_from.as_ref() {
+                paint_scene(from, 1.0 - progress, false);
             }
+            if let Some(scene) = scene.as_ref() {
+                paint_scene(scene, progress, true);
+            }
+            transition_complete = progress >= 1.0;
+        } else if let Some(scene) = scene.as_ref() {
+            paint_scene(scene, 1.0, true);
+        }
+        if transition_complete {
+            self.clear_transition();
         }
 
         if let Some(pointer) = response.interact_pointer_pos() {
@@ -1238,6 +1398,7 @@ impl StreamCraftApp {
                 let hit = scene.as_ref().and_then(|scene| {
                     scene.sources.iter().rev().find(|source| {
                         source.visible
+                            && source.opacity > 0.0
                             && source.x <= scene_point.x
                             && scene_point.x <= source.x + source.w
                             && source.y <= scene_point.y
@@ -1284,6 +1445,7 @@ impl StreamCraftApp {
         }
         let mut open = true;
         let mut action = None;
+        let mut refreshed = false;
         let mut selected = self.capture_target.clone();
         let error = self.capture_preview.error.clone();
         let texture = self.capture_preview.texture.clone();
@@ -1293,7 +1455,7 @@ impl StreamCraftApp {
             .default_size([340.0, 260.0])
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("Live preview only - start a recording to save frames")
+                    RichText::new("Live X11 preview only - recording saves the composed scene")
                         .size(10.5)
                         .color(theme::MUTED),
                 );
@@ -1305,24 +1467,46 @@ impl StreamCraftApp {
                             ui.selectable_value(&mut selected, target.clone(), label);
                         }
                     });
-                if let Some(texture) = &texture {
-                    let width = ui.available_width().min(320.0);
-                    ui.image((texture.id(), Vec2::new(width, width * 720.0 / 1280.0)));
-                } else if let Some(error) = &error {
+                if let Some(error) = &error {
                     ui.label(RichText::new(error).color(theme::ERROR));
-                } else {
+                }
+                if let Some(texture) = &texture {
+                    let width = ui.available_width().clamp(1.0, 320.0);
+                    let [texture_width, texture_height] = texture.size();
+                    let aspect = if texture_width > 0 && texture_height > 0 {
+                        texture_height as f32 / texture_width as f32
+                    } else {
+                        720.0 / 1280.0
+                    };
+                    ui.image((texture.id(), Vec2::new(width, (width * aspect).min(240.0))));
+                } else if error.is_none() {
                     ui.label(RichText::new("Waiting for first frame...").color(theme::FAINT));
                 }
-                if ui.button("Stop capture").clicked() {
-                    action = Some(Action::ToggleCapture);
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh targets").clicked() {
+                        self.refresh_capture_targets();
+                        self.capture_preview.last_attempt = Instant::now() - CAPTURE_INTERVAL;
+                        refreshed = true;
+                    }
+                    if ui.button("Stop capture").clicked() {
+                        action = Some(Action::ToggleCapture);
+                    }
+                });
             });
+        if refreshed {
+            selected = self.capture_target.clone();
+        }
         if selected != self.capture_target {
             self.capture_target = selected;
+            self.capture_preview.texture = None;
+            self.capture_preview.error = None;
             self.capture_preview.last_attempt = Instant::now();
         }
         if !open {
             self.capture_enabled = false;
+            self.capture_preview.texture = None;
+            self.capture_preview.error = None;
+            self.shell.set_status("Capture preview stopped");
         }
         if let Some(action) = action {
             self.handle_action(action);
@@ -1363,6 +1547,27 @@ impl StreamCraftApp {
     }
 }
 
+fn next_repaint_delay(
+    capture_enabled: bool,
+    record_pacer: Option<FramePacer>,
+    audio_running: bool,
+    transitioning: bool,
+) -> Option<Duration> {
+    let capture_delay = capture_enabled.then_some(CAPTURE_INTERVAL);
+    let recording_delay = record_pacer.map(FramePacer::interval);
+    let audio_delay = audio_running.then_some(Duration::from_millis(50));
+    let transition_delay = transitioning.then_some(Duration::from_millis(16));
+    [
+        capture_delay,
+        recording_delay,
+        audio_delay,
+        transition_delay,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
 fn to_color32(color: Color, opacity: f32) -> Color32 {
     let alpha = (f32::from(color.a) * opacity.clamp(0.0, 1.0)).round() as u8;
     Color32::from_rgba_unmultiplied(color.r, color.g, color.b, alpha)
@@ -1395,9 +1600,14 @@ impl eframe::App for StreamCraftApp {
         self.handle_shortcuts(ui);
         self.poll_capture(&ctx);
         self.poll_recording();
-        if self.recording.is_some() {
-            let interval = Duration::from_millis(u64::from(1000 / self.record_fps.max(1)));
-            ctx.request_repaint_after(interval);
+        let audio_running = matches!(self.audio.status(), AudioStatus::Running(_));
+        if let Some(delay) = next_repaint_delay(
+            self.capture_enabled,
+            self.record_pacer,
+            audio_running,
+            self.transition_start.is_some(),
+        ) {
+            ctx.request_repaint_after(delay);
         }
         self.top_bar(ui);
         self.status_bar(ui);
@@ -1416,6 +1626,28 @@ impl eframe::App for StreamCraftApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repaint_delay_covers_preview_meter_recording_and_transitions() {
+        assert_eq!(next_repaint_delay(false, None, false, false), None);
+        assert_eq!(
+            next_repaint_delay(true, None, false, false),
+            Some(CAPTURE_INTERVAL)
+        );
+        assert_eq!(
+            next_repaint_delay(false, None, true, false),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            next_repaint_delay(false, None, false, true),
+            Some(Duration::from_millis(16))
+        );
+        let pacer = FramePacer::new(60).expect("pacer");
+        assert_eq!(
+            next_repaint_delay(true, Some(pacer), true, true),
+            Some(Duration::from_millis(16))
+        );
+    }
 
     #[test]
     fn slugify_produces_safe_file_names() {

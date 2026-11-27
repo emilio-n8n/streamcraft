@@ -33,11 +33,13 @@ mux it. No video encoder is bundled.
 Alternatives: bundle FFmpeg bindings; claim recording works without testing;
 require ffmpeg at build time.
 
-Reasons: no ffmpeg binary is available in this environment, so the fallback
-must be real and testable; the UI must never overstate capabilities.
+Reasons: ffmpeg is an optional runtime dependency, so the fallback must be real
+and testable; the UI must never overstate capabilities.
 
-Consequences: MKV/MP4 paths are implemented but not exercised here; PNG
-sequence recording is unit-tested with real files.
+Consequences: MKV/MP4 encoding is exercised by an integration test when ffmpeg
+is available and by CI. PNG sequences use unique directories plus FPS metadata.
+The recorder anchors its frame timeline to wall-clock time, drains bounded
+ffmpeg diagnostics concurrently, and kills/reaps the child on cancellation.
 
 ## ADR-006 — Schema-compatible transitions
 
